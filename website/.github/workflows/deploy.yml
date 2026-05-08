@@ -1,0 +1,162 @@
+name: Build & Deploy Catalogue of Life Site
+
+# When does this fire?
+#   1. Whenever you publish a new GitHub Release. The release MUST have the
+#      three .tsv files attached. The release tag becomes the data-version
+#      label, and the workflow caches the processed JSON tree under it so
+#      future re-runs are fast.
+#   2. Manually from the Actions tab — useful if you only want to rebuild
+#      the React frontend without re-uploading data.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag holding the .tsv files (e.g. data-v1)'
+        required: true
+        default: 'data-v1'
+      limit:
+        description: 'Optional row cap per TSV (e.g. 50000 for a fast smoke test). Leave blank for the full build.'
+        required: false
+        default: ''
+
+permissions:
+  contents: write     # needed to push to the gh-pages branch
+  pages: read
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      # Pull tag from whichever event fired us. `github.event.release.tag_name`
+      # is set on release events; the manual input fills in otherwise.
+      RELEASE_TAG: ${{ github.event.release.tag_name || github.event.inputs.release_tag || 'data-v1' }}
+      ROW_LIMIT:   ${{ github.event.inputs.limit || '' }}
+
+    steps:
+      # -------------------------------------------------------------------
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Show what triggered this run
+        run: |
+          echo "Event:        ${{ github.event_name }}"
+          echo "Release tag:  $RELEASE_TAG"
+          echo "Row limit:    ${ROW_LIMIT:-<none — full build>}"
+
+      # -------------------------------------------------------------------
+      - name: Free up disk space
+        # Default GitHub runners come with ~14 GB free. The Catalogue of Life
+        # dump unpacks to ~3.5 GB so we trim the pre-installed toolchains
+        # we don't need (Android SDK, .NET, etc.) for comfortable headroom.
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+                      /usr/share/swift /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      # -------------------------------------------------------------------
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # -------------------------------------------------------------------
+      # Cache the processed JSON tree, keyed on (release tag + row limit).
+      # If we already built this exact data before, skip the slow steps.
+      - name: Restore processed data from cache
+        id: cache-data
+        uses: actions/cache@v4
+        with:
+          path: frontend/public/data
+          key: col-data-${{ env.RELEASE_TAG }}-limit-${{ env.ROW_LIMIT || 'full' }}-v1
+
+      # -------------------------------------------------------------------
+      - name: Download TSVs from GitHub Release
+        if: steps.cache-data.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p raw
+          echo "Pulling release '$RELEASE_TAG' …"
+          for FILE in NameUsage.tsv VernacularName.tsv Distribution.tsv; do
+            echo "  fetching $FILE"
+            gh release download "$RELEASE_TAG" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --pattern "$FILE" \
+              --dir raw \
+              --clobber
+          done
+          ls -lah raw
+
+      # -------------------------------------------------------------------
+      - name: Process TSVs into static JSON shards
+        if: steps.cache-data.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p frontend/public/data
+          if [ -n "$ROW_LIMIT" ]; then
+            python scripts/process_data.py \
+              --input raw \
+              --output frontend/public/data \
+              --limit "$ROW_LIMIT"
+          else
+            python scripts/process_data.py \
+              --input raw \
+              --output frontend/public/data
+          fi
+          # Free disk before the frontend build — we no longer need the raw TSVs.
+          rm -rf raw
+          du -sh frontend/public/data
+
+      - name: Note when reusing cached data
+        if: steps.cache-data.outputs.cache-hit == 'true'
+        run: |
+          echo "✅ Reused cached data from a previous run (tag: $RELEASE_TAG)."
+          du -sh frontend/public/data || true
+
+      # -------------------------------------------------------------------
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci || npm install
+
+      - name: Build frontend
+        working-directory: frontend
+        env:
+          # Vite needs the public path so assets resolve under
+          # https://<user>.github.io/<repo>/ correctly.
+          VITE_BASE_PATH: /${{ github.event.repository.name }}/
+        run: npm run build
+
+      # -------------------------------------------------------------------
+      - name: Show output sizes
+        run: |
+          du -sh frontend/dist
+          du -sh frontend/dist/data || true
+          echo "Total files: $(find frontend/dist -type f | wc -l)"
+
+      # -------------------------------------------------------------------
+      # Push the built site to the gh-pages branch. Setting Pages → Source
+      # to "Deploy from a branch → gh-pages /" in repo Settings serves it.
+      - name: Deploy to gh-pages branch
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: frontend/dist
+          publish_branch: gh-pages
+          # Force orphan history each push — keeps the gh-pages branch tiny
+          # (otherwise every rebuild would add a ~750 MB commit).
+          force_orphan: true
+          user_name: 'github-actions[bot]'
+          user_email: 'github-actions[bot]@users.noreply.github.com'
+          commit_message: 'Deploy ${{ env.RELEASE_TAG }} (${{ github.sha }})'
