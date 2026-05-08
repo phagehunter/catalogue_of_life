@@ -84,21 +84,49 @@ jobs:
 
       # -------------------------------------------------------------------
       - name: Download TSVs from GitHub Release
+        # GitHub Releases cap individual files at 2 GB. The full NameUsage.tsv
+        # is ~2.4 GB, so we expect it to have been split with `split` into
+        # NameUsage_part_aa and NameUsage_part_ab. We fetch the parts plus
+        # the smaller files that fit unchanged.
         if: steps.cache-data.outputs.cache-hit != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p raw
           echo "Pulling release '$RELEASE_TAG' …"
-          for FILE in NameUsage.tsv VernacularName.tsv Distribution.tsv; do
-            echo "  fetching $FILE"
+          for PATTERN in "NameUsage_part_*" "VernacularName.tsv" "Distribution.tsv"; do
+            echo "  fetching $PATTERN"
             gh release download "$RELEASE_TAG" \
               --repo "${GITHUB_REPOSITORY}" \
-              --pattern "$FILE" \
+              --pattern "$PATTERN" \
               --dir raw \
               --clobber
           done
           ls -lah raw
+
+      - name: Reassemble NameUsage.tsv from split parts
+        if: steps.cache-data.outputs.cache-hit != 'true'
+        run: |
+          cd raw
+          # Glob in alphabetical order — split's default suffixes (aa, ab, ac…)
+          # are designed for exactly this. `cat` of the parts is byte-identical
+          # to the original file.
+          PARTS=( NameUsage_part_* )
+          if [ "${#PARTS[@]}" -eq 0 ] || [ ! -e "${PARTS[0]}" ]; then
+            echo "::error::No NameUsage_part_* files were downloaded from the release."
+            echo "Did you upload them under the tag '$RELEASE_TAG'?"
+            exit 1
+          fi
+          echo "Combining ${#PARTS[@]} parts:"
+          ls -lah "${PARTS[@]}"
+          cat "${PARTS[@]}" > NameUsage.tsv
+          rm -f "${PARTS[@]}"
+          echo "Result:"
+          ls -lah NameUsage.tsv
+          # Quick sanity check — header should be present and tab-delimited.
+          head -1 NameUsage.tsv | tr '\t' '\n' | head -5
+          # And the line count should be in the millions for the full dump.
+          wc -l NameUsage.tsv
 
       # -------------------------------------------------------------------
       - name: Process TSVs into static JSON shards

@@ -26,6 +26,7 @@ import gzip
 import json
 import os
 import re
+import shutil
 import sqlite3
 import sys
 import time
@@ -140,6 +141,44 @@ def write_json(path: Path, data, *, gzip_too: bool = False) -> None:
         with gzip.open(path.with_suffix(path.suffix + ".gz"), "wb",
                        compresslevel=6) as gz:
             gz.write(payload.encode("utf-8"))
+
+
+# ---------------------------------------------------------------------------
+# Split-file reassembly
+# ---------------------------------------------------------------------------
+#
+# GitHub Releases cap individual file uploads at 2 GB, but the full
+# NameUsage.tsv from the Catalogue of Life dump is ~2.4 GB. The recommended
+# workflow is to split it first with the standard ``split`` command:
+#
+#     split -b 1500m NameUsage.tsv NameUsage_part_
+#
+# That produces ``NameUsage_part_aa`` and ``NameUsage_part_ab`` (and possibly
+# more). When concatenated in alphabetical order they are byte-identical to
+# the original. The CI workflow does this with ``cat`` before invoking us,
+# but we duplicate the logic here so the script also Just Works when run
+# locally with only the split parts on disk.
+
+
+def reassemble_split(in_dir: Path, base_name: str) -> Path | None:
+    """If ``<base_name>.tsv`` is missing but ``<base_name>_part_*`` files exist,
+    concatenate them into ``<base_name>.tsv`` and return its path. Files are
+    joined in lexicographic order (matching ``split``'s ``aa``/``ab`` /
+    ``ac`` / … suffixing). Returns ``None`` if neither exists."""
+    target = in_dir / f"{base_name}.tsv"
+    if target.exists():
+        return target
+    parts = sorted(in_dir.glob(f"{base_name}_part_*"))
+    if not parts:
+        return None
+    log(f"  reassembling {len(parts)} split parts → {target.name}")
+    with target.open("wb") as out:
+        for p in parts:
+            log(f"    + {p.name} ({p.stat().st_size / 1e9:.2f} GB)")
+            with p.open("rb") as fh:
+                shutil.copyfileobj(fh, out, length=16 * 1024 * 1024)
+    log(f"  ✓ combined size: {target.stat().st_size / 1e9:.2f} GB")
+    return target
 
 
 # ---------------------------------------------------------------------------
@@ -582,8 +621,13 @@ def main() -> int:
     try:
         with step("create schema"):
             create_schema(conn)
+        with step("reassemble NameUsage.tsv (if uploaded as split parts)"):
+            name_usage_path = reassemble_split(in_dir, "NameUsage")
+            if name_usage_path is None:
+                log("  ! NameUsage.tsv (or NameUsage_part_*) not found.")
+                name_usage_path = in_dir / "NameUsage.tsv"  # let load_name_usage warn
         with step("load NameUsage.tsv"):
-            n = load_name_usage(conn, in_dir / "NameUsage.tsv", args.limit)
+            n = load_name_usage(conn, name_usage_path, args.limit)
             log(f"  taxa loaded: {n:,}")
         with step("load VernacularName.tsv"):
             n = load_vernacular(conn, in_dir / "VernacularName.tsv", args.limit)
