@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom'
 import { getRoots, getStats } from '../api.js'
 import TaxonCard from '../components/TaxonCard.jsx'
 import Loader from '../components/Loader.jsx'
+import './LCA.css' // shared with LCA page; provides the .lca-feature card styles
 
 export default function Home() {
   const [stats, setStats] = useState(null)
@@ -18,16 +19,15 @@ export default function Home() {
   return (
     <div className="page">
       <section className="hero">
-        <h1>The Tree of Life, made browsable.</h1>
+        <h1>Tools for the Tree of Life</h1>
         <p className="lede">
-          Search, navigate, and learn about every named life form on Earth — from
-          the largest kingdom to the smallest subspecies — using the open
-          Catalogue of Life dataset.
+          Five million species. Two million common names. One free, static site
+          that lets you do things no other taxonomy explorer can.
         </p>
         <div className="cta-row">
-          <Link to="/explore" className="cta primary">Start exploring →</Link>
+          <Link to="/lca" className="cta primary">★ Find a common ancestor →</Link>
+          <Link to="/explore" className="cta">Browse the tree</Link>
           <Link to="/search" className="cta">Search a name</Link>
-          <Link to="/about" className="cta">About this site</Link>
         </div>
       </section>
 
@@ -38,10 +38,29 @@ export default function Home() {
         </div>
       ) : null}
 
+      <section className="lca-feature">
+        <div className="lca-feature-card">
+          <div className="lca-feature-icon" aria-hidden>★</div>
+          <div className="lca-feature-body">
+            <h3>Last Common Ancestor</h3>
+            <p>
+              Pick any two organisms — even ones that seem totally unrelated.
+              We trace both lineages backwards through the tree of life and
+              pin-point the most recent ancestor they share, plus every
+              taxonomic step that took them apart.
+            </p>
+            <p className="lca-feature-examples">
+              Try <em>human ↔ banana</em> · <em>T. rex ↔ chicken</em> · <em>octopus ↔ honeybee</em>
+            </p>
+            <Link to="/lca" className="cta primary">Open the LCA tool →</Link>
+          </div>
+        </div>
+      </section>
+
       {stats ? <StatStrip stats={stats} /> : !error ? <Loader label="Loading dataset stats" /> : null}
 
       <section className="section" style={{ marginTop: '1.5rem' }}>
-        <h2>Browse by kingdom</h2>
+        <h2>Or just browse the kingdoms</h2>
         {roots ? (
           roots.length === 0
             ? <div className="empty">No roots found in the dataset.</div>
@@ -69,8 +88,11 @@ function StatStrip({ stats }) {
       <Stat label="Total taxa" value={stats.totalTaxa.toLocaleString()} />
       <Stat label="Common names" value={stats.totalVernaculars.toLocaleString()} />
       <Stat label="Distribution records" value={stats.totalDistributionEntries.toLocaleString()} />
-      <Stat label="Marked extinct" value={stats.extinctCount.toLocaleString()}
-            sub={pct(stats.extinctCount, stats.totalTaxa)} />
+      <Stat
+        label="Marked extinct"
+        value={stats.extinctCount.toLocaleString()}
+        sub={pct(stats.extinctCount, stats.totalTaxa)}
+      />
       <Stat label="Top-level groups" value={stats.rootCount.toLocaleString()} />
     </div>
   )
@@ -94,7 +116,6 @@ function pct(part, whole) {
 
 function RankBreakdown({ stats }) {
   const counts = stats.rankCounts || {}
-  // Show only major ranks for clarity.
   const major = ['kingdom', 'phylum', 'class', 'order', 'family', 'genus', 'species', 'subspecies', 'variety', 'form']
     .map(r => [r, counts[r] || 0])
     .filter(([, n]) => n > 0)
