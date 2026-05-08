@@ -1,12 +1,19 @@
-name: Build & Deploy Catalogue of Life Site
+name: Build & Deploy Catalogue of Life Site (v2 — subdir-aware)
 
-# When does this fire?
-#   1. Whenever you publish a new GitHub Release. The release MUST have the
-#      three .tsv files attached. The release tag becomes the data-version
-#      label, and the workflow caches the processed JSON tree under it so
-#      future re-runs are fast.
-#   2. Manually from the Actions tab — useful if you only want to rebuild
-#      the React frontend without re-uploading data.
+# =============================================================================
+#  PROJECT LAYOUT
+#  -----------------------------------------------------------------------------
+#  This repo's actual code lives in a `website/` subfolder. Every path below
+#  is therefore anchored to either:
+#
+#    $GITHUB_WORKSPACE/website/   →  the project root (Python script, frontend)
+#    $GITHUB_WORKSPACE/raw/       →  scratch dir for the downloaded TSV files
+#
+#  We never use bare relative paths like `scripts/…` or `frontend/…`,
+#  because the runner's current working directory is whatever a previous
+#  step happened to leave it at.
+# =============================================================================
+
 on:
   release:
     types: [published]
@@ -34,34 +41,87 @@ jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
     timeout-minutes: 90
+
+    # All paths are derived from these four env vars. If you ever rename
+    # the `website/` folder, change ONLY this block.
     env:
-      # Pull tag from whichever event fired us. `github.event.release.tag_name`
-      # is set on release events; the manual input fills in otherwise.
       RELEASE_TAG: ${{ github.event.release.tag_name || github.event.inputs.release_tag || 'data-v1' }}
       ROW_LIMIT:   ${{ github.event.inputs.limit || '' }}
+      PROJECT_DIR: ${{ github.workspace }}/website
+      RAW_DIR:     ${{ github.workspace }}/raw
+      DATA_DIR:    ${{ github.workspace }}/website/frontend/public/data
+      DIST_DIR:    ${{ github.workspace }}/website/frontend/dist
 
     steps:
-      # -------------------------------------------------------------------
+      # =====================================================================
+      #  STEP 1 — Checkout
+      # =====================================================================
       - name: Checkout repo
         uses: actions/checkout@v4
 
+      # =====================================================================
+      #  STEP 2 — Verify project layout (fails fast if the repo is wrong)
+      #
+      #  This runs in 2 seconds and gives you a precise diagnostic instead
+      #  of a confusing failure 30 minutes into the build.
+      # =====================================================================
+      - name: Verify project layout
+        run: |
+          set -e
+          echo "::group::Diagnostics"
+          echo "GITHUB_WORKSPACE = $GITHUB_WORKSPACE"
+          echo "PROJECT_DIR      = $PROJECT_DIR"
+          echo "PWD              = $(pwd)"
+          echo
+          echo "Repo root contents:"
+          ls -la "$GITHUB_WORKSPACE"
+          echo
+          echo "website/ contents:"
+          ls -la "$PROJECT_DIR" || true
+          echo "::endgroup::"
+
+          MISSING=0
+          for REQUIRED in \
+              "$PROJECT_DIR/scripts/process_data.py" \
+              "$PROJECT_DIR/frontend/package.json" \
+              "$PROJECT_DIR/frontend/vite.config.js" ; do
+            if [ ! -f "$REQUIRED" ]; then
+              echo "::error::Missing required file: $REQUIRED"
+              MISSING=1
+            else
+              echo "✓ found $REQUIRED"
+            fi
+          done
+
+          if [ "$MISSING" -ne 0 ]; then
+            echo "::error::Project layout check failed."
+            echo "Expected the project to live under $PROJECT_DIR with"
+            echo "scripts/process_data.py and frontend/package.json inside it."
+            exit 1
+          fi
+          echo "Layout OK ✓"
+
+      # =====================================================================
+      #  STEP 3 — Trigger info
+      # =====================================================================
       - name: Show what triggered this run
         run: |
           echo "Event:        ${{ github.event_name }}"
           echo "Release tag:  $RELEASE_TAG"
           echo "Row limit:    ${ROW_LIMIT:-<none — full build>}"
 
-      # -------------------------------------------------------------------
+      # =====================================================================
+      #  STEP 4 — Free disk space (the TSVs unpack to ~3.5 GB)
+      # =====================================================================
       - name: Free up disk space
-        # Default GitHub runners come with ~14 GB free. The Catalogue of Life
-        # dump unpacks to ~3.5 GB so we trim the pre-installed toolchains
-        # we don't need (Android SDK, .NET, etc.) for comfortable headroom.
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
                       /usr/share/swift /opt/hostedtoolcache/CodeQL || true
           df -h /
 
-      # -------------------------------------------------------------------
+      # =====================================================================
+      #  STEP 5 — Install Python and Node toolchains
+      # =====================================================================
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -72,48 +132,54 @@ jobs:
         with:
           node-version: '20'
 
-      # -------------------------------------------------------------------
-      # Cache the processed JSON tree, keyed on (release tag + row limit).
-      # If we already built this exact data before, skip the slow steps.
+      # =====================================================================
+      #  STEP 6 — Cache restore
+      #  -------------------------------------------------------------------
+      #  Keyed on (release tag + row limit). If we already built this exact
+      #  data before, we skip the slow steps entirely.
+      # =====================================================================
       - name: Restore processed data from cache
         id: cache-data
         uses: actions/cache@v4
         with:
-          path: frontend/public/data
+          path: website/frontend/public/data
           key: col-data-${{ env.RELEASE_TAG }}-limit-${{ env.ROW_LIMIT || 'full' }}-v1
 
-      # -------------------------------------------------------------------
+      # =====================================================================
+      #  STEP 7 — Download the release assets we care about
+      # =====================================================================
       - name: Download TSVs from GitHub Release
-        # GitHub Releases cap individual files at 2 GB. The full NameUsage.tsv
-        # is ~2.4 GB, so we expect it to have been split with `split` into
-        # NameUsage_part_aa and NameUsage_part_ab. We fetch the parts plus
-        # the smaller files that fit unchanged.
         if: steps.cache-data.outputs.cache-hit != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          mkdir -p raw
-          echo "Pulling release '$RELEASE_TAG' …"
+          mkdir -p "$RAW_DIR"
+          echo "Pulling release '$RELEASE_TAG' from $GITHUB_REPOSITORY …"
+          # The release contains 13 assets but we only need these three patterns.
           for PATTERN in "NameUsage_part_*" "VernacularName.tsv" "Distribution.tsv"; do
             echo "  fetching $PATTERN"
             gh release download "$RELEASE_TAG" \
               --repo "${GITHUB_REPOSITORY}" \
               --pattern "$PATTERN" \
-              --dir raw \
+              --dir "$RAW_DIR" \
               --clobber
           done
-          ls -lah raw
+          echo
+          echo "Downloaded:"
+          ls -lah "$RAW_DIR"
 
+      # =====================================================================
+      #  STEP 8 — Reassemble NameUsage.tsv from the split parts
+      # =====================================================================
       - name: Reassemble NameUsage.tsv from split parts
         if: steps.cache-data.outputs.cache-hit != 'true'
+        working-directory: ${{ github.workspace }}/raw
         run: |
-          cd raw
-          # Glob in alphabetical order — split's default suffixes (aa, ab, ac…)
-          # are designed for exactly this. `cat` of the parts is byte-identical
-          # to the original file.
+          set -e
+          echo "PWD: $(pwd)"
           PARTS=( NameUsage_part_* )
           if [ "${#PARTS[@]}" -eq 0 ] || [ ! -e "${PARTS[0]}" ]; then
-            echo "::error::No NameUsage_part_* files were downloaded from the release."
+            echo "::error::No NameUsage_part_* files in $(pwd)."
             echo "Did you upload them under the tag '$RELEASE_TAG'?"
             exit 1
           fi
@@ -123,68 +189,88 @@ jobs:
           rm -f "${PARTS[@]}"
           echo "Result:"
           ls -lah NameUsage.tsv
-          # Quick sanity check — header should be present and tab-delimited.
           head -1 NameUsage.tsv | tr '\t' '\n' | head -5
-          # And the line count should be in the millions for the full dump.
           wc -l NameUsage.tsv
 
-      # -------------------------------------------------------------------
+      # =====================================================================
+      #  STEP 9 — Run the processor
+      #  -------------------------------------------------------------------
+      #  Belt + suspenders: we BOTH `cd` into the project root AND pass an
+      #  absolute path. Either by itself would be enough; together they make
+      #  this step impervious to any cwd surprises from previous steps.
+      # =====================================================================
       - name: Process TSVs into static JSON shards
         if: steps.cache-data.outputs.cache-hit != 'true'
+        working-directory: ${{ github.workspace }}/website
         run: |
-          mkdir -p frontend/public/data
+          set -e
+          echo "PWD: $(pwd)"
+          echo "Will run script: $PROJECT_DIR/scripts/process_data.py"
+          ls -la "$PROJECT_DIR/scripts/"
+
+          mkdir -p "$DATA_DIR"
+
           if [ -n "$ROW_LIMIT" ]; then
-            python scripts/process_data.py \
-              --input raw \
-              --output frontend/public/data \
-              --limit "$ROW_LIMIT"
+            python "$PROJECT_DIR/scripts/process_data.py" \
+              --input  "$RAW_DIR" \
+              --output "$DATA_DIR" \
+              --limit  "$ROW_LIMIT"
           else
-            python scripts/process_data.py \
-              --input raw \
-              --output frontend/public/data
+            python "$PROJECT_DIR/scripts/process_data.py" \
+              --input  "$RAW_DIR" \
+              --output "$DATA_DIR"
           fi
+
+          echo "Output produced:"
+          du -sh "$DATA_DIR"
           # Free disk before the frontend build — we no longer need the raw TSVs.
-          rm -rf raw
-          du -sh frontend/public/data
+          rm -rf "$RAW_DIR"
+          df -h /
 
       - name: Note when reusing cached data
         if: steps.cache-data.outputs.cache-hit == 'true'
         run: |
           echo "✅ Reused cached data from a previous run (tag: $RELEASE_TAG)."
-          du -sh frontend/public/data || true
+          du -sh "$DATA_DIR" || true
 
-      # -------------------------------------------------------------------
+      # =====================================================================
+      #  STEP 10 — Build the React frontend
+      # =====================================================================
       - name: Install frontend dependencies
-        working-directory: frontend
-        run: npm ci || npm install
+        working-directory: ${{ github.workspace }}/website/frontend
+        run: |
+          echo "PWD: $(pwd)"
+          ls -la
+          npm ci || npm install
 
       - name: Build frontend
-        working-directory: frontend
+        working-directory: ${{ github.workspace }}/website/frontend
         env:
           # Vite needs the public path so assets resolve under
           # https://<user>.github.io/<repo>/ correctly.
           VITE_BASE_PATH: /${{ github.event.repository.name }}/
-        run: npm run build
+        run: |
+          echo "PWD: $(pwd)"
+          npm run build
 
-      # -------------------------------------------------------------------
       - name: Show output sizes
         run: |
-          du -sh frontend/dist
-          du -sh frontend/dist/data || true
-          echo "Total files: $(find frontend/dist -type f | wc -l)"
+          du -sh "$DIST_DIR"
+          du -sh "$DIST_DIR/data" || true
+          echo "Total files: $(find "$DIST_DIR" -type f | wc -l)"
 
-      # -------------------------------------------------------------------
-      # Push the built site to the gh-pages branch. Setting Pages → Source
-      # to "Deploy from a branch → gh-pages /" in repo Settings serves it.
+      # =====================================================================
+      #  STEP 11 — Deploy to gh-pages branch
+      # =====================================================================
       - name: Deploy to gh-pages branch
         uses: peaceiris/actions-gh-pages@v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: frontend/dist
+          publish_dir:  website/frontend/dist
           publish_branch: gh-pages
           # Force orphan history each push — keeps the gh-pages branch tiny
-          # (otherwise every rebuild would add a ~750 MB commit).
+          # (otherwise every rebuild would add a ~750 MB commit on top).
           force_orphan: true
-          user_name: 'github-actions[bot]'
+          user_name:  'github-actions[bot]'
           user_email: 'github-actions[bot]@users.noreply.github.com'
           commit_message: 'Deploy ${{ env.RELEASE_TAG }} (${{ github.sha }})'
