@@ -132,16 +132,16 @@ jobs:
       - name: Process TSVs into static JSON shards
         if: steps.cache-data.outputs.cache-hit != 'true'
         run: |
-          mkdir -p website/frontend/public/data
+          mkdir -p frontend/public/data
           if [ -n "$ROW_LIMIT" ]; then
-        python website/scripts/process_data.py \
-          --input raw \
-          --output website/frontend/public/data \
-          --limit "$ROW_LIMIT"
-          else
-            python website/scripts/process_data.py \
+            python scripts/process_data.py \
               --input raw \
-              --output website/frontend/public/data
+              --output frontend/public/data \
+              --limit "$ROW_LIMIT"
+          else
+            python scripts/process_data.py \
+              --input raw \
+              --output frontend/public/data
           fi
           # Free disk before the frontend build — we no longer need the raw TSVs.
           rm -rf raw
@@ -155,7 +155,7 @@ jobs:
 
       # -------------------------------------------------------------------
       - name: Install frontend dependencies
-        working-directory: website/frontend
+        working-directory: frontend
         run: npm ci || npm install
 
       - name: Build frontend
