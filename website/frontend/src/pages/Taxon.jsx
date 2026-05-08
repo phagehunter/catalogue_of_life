@@ -93,19 +93,29 @@ export default function Taxon() {
       </header>
 
       <div className="two-col">
-        <section className="section">
+                <section className="section">
           <h2>Classification</h2>
-          {Object.keys(lineage).length === 0
-            ? <div className="empty" style={{ padding: '.75rem' }}>
-                No denormalised lineage data — see breadcrumb above for the actual parent chain.
-              </div>
-            : (
-              <div className="kv">
-                {entries(lineage).map(([k, v]) => (
-                  <RowEither key={k} k={RANK_LABEL[expand(k)] || expand(k)} v={v} />
-                ))}
-              </div>
-            )}
+          {Object.keys(lineage).length > 0 ? (
+            <div className="kv">
+              {entries(lineage).map(([k, v]) => (
+                <RowEither key={k} k={RANK_LABEL[expand(k)] || expand(k)} v={v} />
+              ))}
+            </div>
+          ) : chain.length > 1 ? (
+            <div className="kv">
+              {chain.slice(0, -1).map(t => (
+                <RowEither
+                  key={t.i}
+                  k={t.r ? t.r.charAt(0).toUpperCase() + t.r.slice(1) : 'Ancestor'}
+                  v={<Link to={`/taxon/${encodeURIComponent(t.i)}`}>{t.n}</Link>}
+                />
+              ))}
+            </div>
+          ) : (
+            <div className="empty" style={{ padding: '.75rem' }}>
+              Top-level group — no parents above.
+            </div>
+          )}
         </section>
 
         <section className="section">
