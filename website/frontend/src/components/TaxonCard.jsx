@@ -22,7 +22,7 @@ export default function TaxonCard({ taxon }) {
           ? <span className={`pill status-${taxon.s}`}>{taxon.s}</span>
           : null}
         {taxon.c?.length
-          ? <span className="pill">{taxon.c.length.toLocaleString()} children</span>
+          ? <span className="pill">{taxon.c.length.toLocaleString()} {taxon.c.length === 1 ? 'child' : 'children'}</span>
           : null}
       </div>
     </Link>
