@@ -4,6 +4,7 @@ import Explore from './pages/Explore.jsx'
 import SearchPage from './pages/Search.jsx'
 import Taxon from './pages/Taxon.jsx'
 import About from './pages/About.jsx'
+import LCA from './pages/LCA.jsx'
 import GlobalSearchBar from './components/GlobalSearchBar.jsx'
 
 export default function App() {
@@ -16,7 +17,8 @@ export default function App() {
         </NavLink>
         <nav className="nav">
           <NavLink to="/" end>Home</NavLink>
-          <NavLink to="/explore">Explore</NavLink>
+          <NavLink to="/lca">★ LCA</NavLink>
+          <NavLink to="/explore">Browse</NavLink>
           <NavLink to="/search">Search</NavLink>
           <NavLink to="/about">About</NavLink>
         </nav>
@@ -28,6 +30,7 @@ export default function App() {
       <main className="main">
         <Routes>
           <Route path="/" element={<Home />} />
+          <Route path="/lca" element={<LCA />} />
           <Route path="/explore" element={<Explore />} />
           <Route path="/search" element={<SearchPage />} />
           <Route path="/taxon/:id" element={<Taxon />} />
@@ -53,7 +56,7 @@ function NotFound() {
   return (
     <div className="page narrow">
       <h1>Lost in the tree of life</h1>
-      <p>That page does not exist. Try the <NavLink to="/explore">Explore</NavLink> tab.</p>
+      <p>That page does not exist. Try the <NavLink to="/explore">Browse</NavLink> tab.</p>
     </div>
   )
 }
