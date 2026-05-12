@@ -5,17 +5,19 @@ import './LCA.css'
 
 // ===========================================================================
 //  "How related?" — multi-species phylogenetic comparator.
-//
-//  Picks 2 to 6 taxa, walks each lineage, merges them into one tree, and
-//  renders a real SVG cladogram with pairwise relatedness verdicts.
-//
-//  All computation is in-browser against the existing sharded JSON.
 // ===========================================================================
 
 const MAX_SPECIES = 6
 const SPECIES_COLORS = ['#6fd49a', '#f5d27a', '#d97757', '#a78bfa', '#5cc8d4', '#ff8fb6']
 
-// Curated educational pairings rather than trivia ↔ trivia.
+// The 7 classical ranks + domain + subspecies. Anything else stays as a
+// branch point in the tree but its label is hidden, so the visualization
+// doesn't collapse into a wall of overlapping italics.
+const MAJOR_RANKS = new Set([
+  'domain', 'kingdom', 'phylum', 'class', 'order', 'family', 'genus',
+  'species', 'subspecies'
+])
+
 const PRESETS = [
   {
     label: 'Vertebrate body plans',
@@ -29,7 +31,7 @@ const PRESETS = [
   },
   {
     label: 'Plant kingdom across deep time',
-    note: 'Flowering plant, fern, moss, alga',
+    note: 'Flowering plant, fern, moss',
     queries: ['Quercus', 'Pteridium', 'Sphagnum'],
   },
   {
@@ -44,12 +46,11 @@ const PRESETS = [
   },
   {
     label: 'Same name, different kingdoms',
-    note: 'Why "fish" and "starfish" share more than a name… or do they?',
+    note: 'A "fish" and a "starfish" share less than the name suggests',
     queries: ['Salmo', 'Asterias'],
   },
 ]
 
-// Rank → human-readable verdict.
 const RELATEDNESS = {
   species:      ['identical',         'Same species'],
   subspecies:   ['near-twins',        'Same species, different subspecies'],
@@ -82,6 +83,22 @@ const DEFAULT_VERDICT = ['life-tree cousins', 'Share only the deepest history of
 
 const RANK_PRETTY = (r) => r ? r.charAt(0).toUpperCase() + r.slice(1) : 'Unranked'
 
+// Pick the most useful common name to surface: preferred English first,
+// then any English, then any preferred name in any language. We never
+// fall back to a random non-English non-preferred entry because that
+// tends to be noisy.
+function bestVernacular(taxon) {
+  if (!taxon?.v?.length) return null
+  const engPref = taxon.v.find(v => v.l === 'eng' && v.p)
+  if (engPref) return { name: engPref.n, lang: 'eng', isEng: true }
+  const engAny = taxon.v.find(v => v.l === 'eng')
+  if (engAny) return { name: engAny.n, lang: 'eng', isEng: true }
+  const pref = taxon.v.find(v => v.p)
+  if (pref) return { name: pref.n, lang: pref.l || '', isEng: false }
+  return null
+}
+
+
 // ===========================================================================
 //  Page
 // ===========================================================================
@@ -94,7 +111,6 @@ export default function LCA() {
   const [copied, setCopied] = useState(false)
   const initialised = useRef(false)
 
-  // Restore from URL on mount: ?a=ID1&b=ID2&c=ID3…
   useEffect(() => {
     if (initialised.current) return
     initialised.current = true
@@ -106,7 +122,6 @@ export default function LCA() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // Walk each species' lineage when the list changes.
   useEffect(() => {
     if (species.length === 0) { setChains([]); return }
     let cancelled = false
@@ -126,7 +141,6 @@ export default function LCA() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [species.map(s => s.i).join('|')])
 
-  // Build the merged tree + pairwise MRCAs.
   const analysis = useMemo(() => analyseChains(species, chains), [species, chains])
 
   function addSpecies(t) {
@@ -135,9 +149,7 @@ export default function LCA() {
     if (species.length >= MAX_SPECIES) return
     setSpecies([...species, t])
   }
-  function removeSpecies(idx) {
-    setSpecies(species.filter((_, i) => i !== idx))
-  }
+  function removeSpecies(idx) { setSpecies(species.filter((_, i) => i !== idx)) }
   function clearAll() { setSpecies([]) }
 
   async function loadPreset(queries) {
@@ -163,9 +175,9 @@ export default function LCA() {
       <header className="lca-hero">
         <h1>How related are these species?</h1>
         <p className="lede">
-          Pick two to six organisms. We'll trace each lineage through the
-          Catalogue of Life, build a real phylogenetic tree, and tell you in
-          plain English how close every pair really is.
+          Pick two to six organisms — by Latin name <em>or</em> common name.
+          We trace each lineage through the Catalogue of Life, build a real
+          phylogenetic tree, and report exactly how close every pair is.
         </p>
       </header>
 
@@ -206,7 +218,6 @@ function SpeciesList({ species, onAdd, onRemove, onClear, busy }) {
         <SpeciesChip
           key={s.i + ':' + i}
           species={s}
-          index={i}
           color={SPECIES_COLORS[i % SPECIES_COLORS.length]}
           onRemove={() => onRemove(i)}
         />
@@ -233,6 +244,7 @@ function SpeciesList({ species, onAdd, onRemove, onClear, busy }) {
 }
 
 function SpeciesChip({ species, color, onRemove }) {
+  const vern = bestVernacular(species)
   return (
     <div className="lca-chip" style={{ borderColor: color }}>
       <span className="lca-chip-dot" style={{ background: color }} />
@@ -241,8 +253,11 @@ function SpeciesChip({ species, color, onRemove }) {
         <Link to={`/taxon/${encodeURIComponent(species.i)}`} className="lca-chip-name">
           {species.n}
         </Link>
-        {species.v?.length ? (
-          <div className="lca-chip-vern">{species.v[0].n}</div>
+        {vern ? (
+          <div className="lca-chip-vern">
+            {vern.name}
+            {!vern.isEng && vern.lang ? <span className="lca-chip-vern-lang"> [{vern.lang}]</span> : null}
+          </div>
         ) : null}
       </div>
       <button type="button" className="lca-chip-remove" onClick={onRemove} aria-label="Remove">×</button>
@@ -294,7 +309,7 @@ function SpeciesPicker({ label, color, onPick }) {
       <label style={{ color }}>{label}</label>
       <input
         type="search"
-        placeholder="Type a name (species, genus, family)…"
+        placeholder="Type a name (Latin or common — e.g. tiger, oak, dog)…"
         value={q}
         onChange={e => { setQ(e.target.value); setOpen(true) }}
         onFocus={() => setOpen(true)}
@@ -323,13 +338,12 @@ function SpeciesPicker({ label, color, onPick }) {
 
 
 // ===========================================================================
-//  Tree analysis — merge chains, find MRCAs, compute pairwise verdicts
+//  Tree analysis
 // ===========================================================================
 
 function analyseChains(species, chains) {
   if (chains.length < 2 || chains.some(c => !c?.length)) return null
 
-  // Merge chains into a tree.
   const root = { id: '__root__', name: 'root', rank: null, children: [], speciesAtEnd: [], depth: 0, parent: null }
   chains.forEach((chain, idx) => {
     let cur = root
@@ -354,7 +368,6 @@ function analyseChains(species, chains) {
     cur.speciesAtEnd.push(idx)
   })
 
-  // Annotate each node with the set of species that pass through it.
   function annotate(node) {
     const set = new Set(node.speciesAtEnd)
     for (const c of node.children) {
@@ -366,8 +379,6 @@ function analyseChains(species, chains) {
   }
   annotate(root)
 
-  // Pairwise MRCAs: for each pair (i, j), the deepest node whose
-  // speciesPassing contains both i and j.
   const pairs = []
   for (let i = 0; i < species.length; i++) {
     for (let j = i + 1; j < species.length; j++) {
@@ -376,7 +387,6 @@ function analyseChains(species, chains) {
     }
   }
 
-  // Overall MRCA = deepest node containing ALL species.
   let overall = root
   function findOverall(node) {
     if (node.speciesPassing.size === species.length && node.depth > overall.depth) overall = node
@@ -401,7 +411,7 @@ function deepestCommon(root, i, j) {
 
 
 // ===========================================================================
-//  Verdict grid — pairwise "how related?" rendered as a real summary
+//  Verdict grid
 // ===========================================================================
 
 function VerdictGrid({ analysis, species }) {
@@ -427,16 +437,24 @@ function VerdictGrid({ analysis, species }) {
         <div className="lca-pairgrid">
           {analysis.pairs.map(({ i, j, mrca }) => {
             const [word, detail] = verdictFor(mrca?.rank)
+            const vernI = bestVernacular(species[i])
+            const vernJ = bestVernacular(species[j])
             return (
               <div className="lca-pair" key={`${i}_${j}`}>
                 <div className="lca-pair-species">
                   <Dot color={SPECIES_COLORS[i % SPECIES_COLORS.length]} />
-                  <em>{species[i].n}</em>
+                  <span className="lca-pair-name">
+                    <em>{species[i].n}</em>
+                    {vernI ? <span className="lca-pair-vern"> · {vernI.name}</span> : null}
+                  </span>
                 </div>
                 <div className="lca-pair-vs">↔</div>
                 <div className="lca-pair-species">
                   <Dot color={SPECIES_COLORS[j % SPECIES_COLORS.length]} />
-                  <em>{species[j].n}</em>
+                  <span className="lca-pair-name">
+                    <em>{species[j].n}</em>
+                    {vernJ ? <span className="lca-pair-vern"> · {vernJ.name}</span> : null}
+                  </span>
                 </div>
                 <div className="lca-pair-verdict">
                   <span className="lca-pair-word">{word}</span>
@@ -461,11 +479,11 @@ function verdictFor(rank) {
 
 
 // ===========================================================================
-//  Cladogram — SVG phylogenetic tree
+//  Cladogram
 // ===========================================================================
 
-const ROW_HEIGHT = 56
-const LEFT_PAD = 80
+const ROW_HEIGHT = 64
+const LEFT_PAD = 60
 const RIGHT_PAD = 280
 const SVG_WIDTH = 1100
 
@@ -485,11 +503,6 @@ function Cladogram({ analysis, species }) {
           role="img"
           aria-label="Phylogenetic tree connecting the chosen species"
         >
-          {/* Background grid: faint rank lanes */}
-          <g className="lca-cladogram-grid">
-            {/* Subtle vertical guide lines could go here */}
-          </g>
-
           {/* Branches */}
           {edges.map(e => (
             <path
@@ -499,21 +512,29 @@ function Cladogram({ analysis, species }) {
             />
           ))}
 
-          {/* Internal nodes — rank/name labels at every branching point */}
-          {internalNodes.map(n => (
-            <g key={n.id} className={`lca-internal ${n.isMRCA ? 'lca-internal-mrca' : ''}`}>
-              <circle cx={n.x} cy={n.y} r={n.isMRCA ? 5 : 3} />
-              <text x={n.x} y={n.y - 9} textAnchor="middle">
-                <tspan className="lca-internal-rank">{RANK_PRETTY(n.rank)}</tspan>
-                <tspan dx="6" className="lca-internal-name">{n.name}</tspan>
-              </text>
-            </g>
-          ))}
+          {/* Internal nodes — only major ranks get labels; everything else
+              renders as a tiny unlabeled dot so the tree structure stays
+              honest without becoming a wall of text. */}
+          {internalNodes.map(n => {
+            const showLabel = MAJOR_RANKS.has(n.rank) || n.id === analysis.overall.id
+            return (
+              <g key={n.id} className={`lca-internal ${n.isMRCA ? 'lca-internal-mrca' : ''}`}>
+                <circle cx={n.x} cy={n.y} r={n.isMRCA ? 5 : 2.5} />
+                {showLabel ? (
+                  <text x={n.x + 8} y={n.y - 9}>
+                    <tspan className="lca-internal-rank">{RANK_PRETTY(n.rank)}</tspan>
+                    <tspan dx="6" className="lca-internal-name">{n.name}</tspan>
+                  </text>
+                ) : null}
+              </g>
+            )
+          })}
 
           {/* Leaves — the picked species */}
           {leaves.map((leaf) => {
             const color = SPECIES_COLORS[leaf.speciesIdx % SPECIES_COLORS.length]
             const sp = species[leaf.speciesIdx]
+            const vern = bestVernacular(sp)
             return (
               <g key={`leaf_${leaf.speciesIdx}`} className="lca-leaf">
                 <line
@@ -529,9 +550,10 @@ function Cladogram({ analysis, species }) {
                   <text x={SVG_WIDTH - RIGHT_PAD + 22} y={leaf.y + 5} className="lca-leaf-name">
                     <tspan fontStyle="italic">{sp.n}</tspan>
                   </text>
-                  {sp.v?.length ? (
+                  {vern ? (
                     <text x={SVG_WIDTH - RIGHT_PAD + 22} y={leaf.y + 22} className="lca-leaf-vern">
-                      {sp.v[0].n}
+                      {vern.name}
+                      {!vern.isEng && vern.lang ? ` [${vern.lang}]` : ''}
                     </text>
                   ) : null}
                 </a>
@@ -541,9 +563,11 @@ function Cladogram({ analysis, species }) {
         </svg>
       </div>
       <div className="lca-cladogram-legend">
-        Time / divergence flows <strong>left → right</strong>. Branching points
-        are taxonomic ranks; the largest gold circles are MRCAs (Most Recent
-        Common Ancestors). Click any name to open its full taxon page.
+        Time / divergence flows <strong>left → right</strong>. Gold circles mark
+        common ancestors (MRCAs); labelled stops are the seven classical
+        ranks plus domain. Tiny grey dots are intermediate branch points
+        (subclass, infraorder, tribe…) shown for structure but unlabelled
+        to keep the tree readable. Click any name to open its full taxon page.
       </div>
     </section>
   )
@@ -552,18 +576,14 @@ function Cladogram({ analysis, species }) {
 function layoutTree(root, species) {
   if (!root || species.length < 2) return null
 
-  // 1. Collect leaves in DFS order so siblings stay together visually.
   const leaves = []
   function visit(node) {
     for (const idx of node.speciesAtEnd) leaves.push({ speciesIdx: idx, node })
     for (const c of node.children) visit(c)
   }
   visit(root)
+  leaves.forEach((l, i) => { l.y = 40 + i * ROW_HEIGHT })
 
-  // 2. Assign y-coords to each leaf row.
-  leaves.forEach((l, i) => { l.y = 36 + i * ROW_HEIGHT })
-
-  // 3. Compute internal node y as midpoint of its leaves' span.
   function descendantLeafYs(node, out = []) {
     for (const idx of node.speciesAtEnd) {
       const l = leaves.find(L => L.node === node && L.speciesIdx === idx)
@@ -573,18 +593,12 @@ function layoutTree(root, species) {
     return out
   }
   function assignY(node) {
-    if (node === root) {
-      const ys = descendantLeafYs(node)
-      node.y = ys.length ? (Math.min(...ys) + Math.max(...ys)) / 2 : 0
-    } else {
-      const ys = descendantLeafYs(node)
-      node.y = ys.length ? (Math.min(...ys) + Math.max(...ys)) / 2 : 0
-    }
+    const ys = descendantLeafYs(node)
+    node.y = ys.length ? (Math.min(...ys) + Math.max(...ys)) / 2 : 0
     for (const c of node.children) assignY(c)
   }
   assignY(root)
 
-  // 4. Compute x by depth. Find max depth among internal nodes (leaves use parent's x).
   let maxDepth = 1
   function findMax(node) {
     if (node.depth > maxDepth) maxDepth = node.depth
@@ -599,27 +613,24 @@ function layoutTree(root, species) {
   }
   assignX(root)
 
-  // 5. Collect edges (parent → child).
   const edges = []
   const internalNodes = []
   function walk(node) {
     if (node !== root) internalNodes.push(node)
     for (const c of node.children) {
-      const speciesShared = new Set([...c.speciesPassing])
       edges.push({
         id: `${node.id}__${c.id}`,
         x1: node.x, y1: node.y, x2: c.x, y2: c.y,
-        isMRCAEdge: speciesShared.size >= 2,
+        isMRCAEdge: c.speciesPassing.size >= 2,
       })
       walk(c)
     }
   }
   walk(root)
 
-  // 6. Mark MRCAs (any internal node whose speciesPassing >= 2).
   internalNodes.forEach(n => { n.isMRCA = n.speciesPassing.size >= 2 })
 
-  const height = 36 + leaves.length * ROW_HEIGHT + 36
+  const height = 40 + leaves.length * ROW_HEIGHT + 40
   return { leaves, edges, internalNodes, height }
 }
 
