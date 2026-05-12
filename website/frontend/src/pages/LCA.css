@@ -80,6 +80,11 @@
   color: var(--moss);
   margin-top: 0.1rem;
 }
+.lca-chip-vern-lang {
+  color: var(--ink-faint);
+  font-size: 0.7rem;
+  text-transform: uppercase;
+}
 .lca-chip-remove {
   background: transparent;
   border: none;
@@ -230,7 +235,22 @@
   font-size: 0.92rem;
   min-width: 0;
 }
-.lca-pair-species em {
+.lca-pair-name {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.lca-pair-name em {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.lca-pair-vern {
+  color: var(--moss);
+  font-size: 0.78rem;
+  font-style: normal;
+  margin-top: 0.05rem;
+  display: block;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
