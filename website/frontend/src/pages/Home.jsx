@@ -3,7 +3,7 @@ import { Link } from 'react-router-dom'
 import { getRoots, getStats } from '../api.js'
 import TaxonCard from '../components/TaxonCard.jsx'
 import Loader from '../components/Loader.jsx'
-import './LCA.css' // shared with LCA page; provides the .lca-feature styles
+import './LCA.css'
 
 export default function Home() {
   const [stats, setStats] = useState(null)
@@ -44,11 +44,10 @@ export default function Home() {
           <div className="lca-feature-body">
             <h3>How related are these species?</h3>
             <p>
-              Drop in two to six organisms — Latin or common name. We build
-              a real phylogenetic tree and tell you, in plain English,
-              <em> exactly</em> how closely every pair is related. "Siblings"
-              (same genus), "cousins" (same family), "kingdom-mates"
-              (totally different body plans).
+              Drop in two to six organisms — by Latin or common name. We build
+              a real phylogenetic tree and tell you exactly how closely every
+              pair is related: "siblings" (same genus), "cousins" (same family),
+              or "kingdom-mates" (totally different body plans).
             </p>
             <p className="lca-feature-examples">
               Curated examples: <em>vertebrate body plans</em> · <em>three
@@ -79,7 +78,7 @@ export default function Home() {
         ) : !error ? <Loader /> : null}
       </section>
 
-      {stats ? <RankBreakdown stats={stats} /> : null}
+      {stats ? <KingdomBreakdown stats={stats} /> : null}
     </div>
   )
 }
@@ -116,25 +115,54 @@ function pct(part, whole) {
   return `${p.toFixed(p < 1 ? 2 : 1)}% of all taxa`
 }
 
-function RankBreakdown({ stats }) {
-  const counts = stats.rankCounts || {}
-  const major = ['kingdom', 'phylum', 'class', 'order', 'family', 'genus', 'species', 'subspecies', 'variety', 'form']
-    .map(r => [r, counts[r] || 0])
-    .filter(([, n]) => n > 0)
-  if (major.length === 0) return null
-  const max = Math.max(...major.map(([, n]) => n))
+// Biodiversity by kingdom — replaces the previous global rank table.
+// Drives off stats.kingdomCounts emitted by the Python processor.
+function KingdomBreakdown({ stats }) {
+  const kc = stats.kingdomCounts || {}
+  const kingdoms = Object.entries(kc)
+    .map(([name, rankMap]) => {
+      const ranks = rankMap || {}
+      const total = Object.values(ranks).reduce((a, b) => a + b, 0)
+      return {
+        name,
+        total,
+        species: ranks.species || 0,
+        genus: ranks.genus || 0,
+        family: ranks.family || 0,
+      }
+    })
+    .filter(k => k.total > 0)
+    .sort((a, b) => b.total - a.total)
+
+  if (kingdoms.length === 0) return null
+  const max = Math.max(...kingdoms.map(k => k.total))
+
   return (
     <section className="section" style={{ marginTop: '1rem' }}>
-      <h2>Rank distribution</h2>
+      <h2>Biodiversity by kingdom</h2>
+      <p style={{ color: 'var(--ink-dim)', marginTop: 0 }}>
+        How named taxa are distributed across the major branches of life — the
+        full count for each kingdom and how many of those are species.
+      </p>
       <div className="rank-chart">
-        {major.map(([rank, n]) => (
-          <div className="row" key={rank}>
-            <span className="label">{rank}</span>
-            <span className="bar"><span style={{ width: `${(n / max) * 100}%` }} /></span>
-            <span className="num">{n.toLocaleString()}</span>
+        {kingdoms.map(k => (
+          <div
+            className="row"
+            key={k.name}
+            title={`${k.total.toLocaleString()} total · ${k.species.toLocaleString()} species · ${k.genus.toLocaleString()} genera · ${k.family.toLocaleString()} families`}
+          >
+            <span className="label">
+              <em style={{ fontStyle: k.name.startsWith('(') ? 'normal' : 'italic' }}>{k.name}</em>
+            </span>
+            <span className="bar"><span style={{ width: `${(k.total / max) * 100}%` }} /></span>
+            <span className="num">{k.total.toLocaleString()}</span>
           </div>
         ))}
       </div>
+      <p style={{ color: 'var(--ink-faint)', fontSize: '0.82rem', marginTop: '0.85rem', marginBottom: 0 }}>
+        Total named taxa per kingdom. Hover any row to see the breakdown
+        (species / genera / families).
+      </p>
     </section>
   )
 }
