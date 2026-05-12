@@ -573,6 +573,25 @@ def emit_stats(conn: sqlite3.Connection, out_dir: Path, roots: list[dict]) -> di
     vern_total = conn.execute("SELECT COUNT(*) FROM vernacular").fetchone()[0]
     dist_total = conn.execute("SELECT COUNT(*) FROM distribution").fetchone()[0]
 
+    # Per-kingdom breakdown so the home page can show actual biodiversity
+    # distribution (Animalia vs Plantae vs Fungi etc.) instead of a flat
+    # rank-count table that doesn't answer any interesting question.
+    kingdom_counts: dict[str, dict[str, int]] = {}
+    for kingdom, rank, count in conn.execute(
+        """SELECT kingdom, COALESCE(rank, 'unranked'), COUNT(*)
+           FROM taxa
+           WHERE kingdom IS NOT NULL AND kingdom != ''
+           GROUP BY kingdom, rank"""
+    ):
+        kingdom_counts.setdefault(kingdom, {})[rank] = count
+    # Tag taxa without any kingdom field separately (mostly viruses and
+    # incertae sedis records) so the chart can show them honestly.
+    no_kingdom = conn.execute(
+        "SELECT COUNT(*) FROM taxa WHERE kingdom IS NULL OR kingdom = ''"
+    ).fetchone()[0]
+    if no_kingdom:
+        kingdom_counts["(no kingdom assigned)"] = {"unranked": no_kingdom}
+
     stats = {
         "totalTaxa": total,
         "totalVernaculars": vern_total,
@@ -581,6 +600,7 @@ def emit_stats(conn: sqlite3.Connection, out_dir: Path, roots: list[dict]) -> di
         "rootCount": len(roots),
         "rankCounts": rank_counts,
         "statusCounts": status_counts,
+        "kingdomCounts": kingdom_counts,
         "rankOrder": RANK_ORDER,
         "numShards": NUM_SHARDS,
         "generatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
