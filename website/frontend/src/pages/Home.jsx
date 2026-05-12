@@ -3,7 +3,7 @@ import { Link } from 'react-router-dom'
 import { getRoots, getStats } from '../api.js'
 import TaxonCard from '../components/TaxonCard.jsx'
 import Loader from '../components/Loader.jsx'
-import './LCA.css' // shared with LCA page; provides the .lca-feature card styles
+import './LCA.css' // shared with LCA page; provides the .lca-feature styles
 
 export default function Home() {
   const [stats, setStats] = useState(null)
@@ -21,11 +21,11 @@ export default function Home() {
       <section className="hero">
         <h1>Tools for the Tree of Life</h1>
         <p className="lede">
-          Five million species. Two million common names. One free, static site
-          that lets you do things no other taxonomy explorer can.
+          Five million species. Two million common names. One free, static
+          site that lets you do things no other taxonomy explorer can.
         </p>
         <div className="cta-row">
-          <Link to="/lca" className="cta primary">★ Find a common ancestor →</Link>
+          <Link to="/lca" className="cta primary">★ Compare species →</Link>
           <Link to="/explore" className="cta">Browse the tree</Link>
           <Link to="/search" className="cta">Search a name</Link>
         </div>
@@ -42,17 +42,19 @@ export default function Home() {
         <div className="lca-feature-card">
           <div className="lca-feature-icon" aria-hidden>★</div>
           <div className="lca-feature-body">
-            <h3>Last Common Ancestor</h3>
+            <h3>How related are these species?</h3>
             <p>
-              Pick any two organisms — even ones that seem totally unrelated.
-              We trace both lineages backwards through the tree of life and
-              pin-point the most recent ancestor they share, plus every
-              taxonomic step that took them apart.
+              Drop in two to six organisms — Latin or common name. We build
+              a real phylogenetic tree and tell you, in plain English,
+              <em> exactly</em> how closely every pair is related. "Siblings"
+              (same genus), "cousins" (same family), "kingdom-mates"
+              (totally different body plans).
             </p>
             <p className="lca-feature-examples">
-              Try <em>human ↔ banana</em> · <em>T. rex ↔ chicken</em> · <em>octopus ↔ honeybee</em>
+              Curated examples: <em>vertebrate body plans</em> · <em>three
+              solutions to flight</em> · <em>same-genus siblings</em>
             </p>
-            <Link to="/lca" className="cta primary">Open the LCA tool →</Link>
+            <Link to="/lca" className="cta primary">Open the comparator →</Link>
           </div>
         </div>
       </section>
