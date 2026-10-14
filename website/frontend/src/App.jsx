@@ -62,7 +62,7 @@ export default function App() {
         <div className="footer-inner">
           <MetaProvider><Citation long /></MetaProvider>
           <div>
-            Built as a static site with React and Vite. <a href={REPO_URL} target="_blank" rel="noreferrer">Source on GitHub</a> · Code MIT licensed.
+            Built by <a href="https://curtishoffmann.com/" target="_blank" rel="noreferrer">Curtis Hoffmann</a> as a static site with React and Vite. <a href={REPO_URL} target="_blank" rel="noreferrer">Source on GitHub</a> · Code MIT licensed.
           </div>
         </div>
       </footer>

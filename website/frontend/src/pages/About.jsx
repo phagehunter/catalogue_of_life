@@ -61,7 +61,7 @@ export default function About() {
           Some records in the XR have no resolvable parent ({formatCount(c.orphanHigherTaxa)} higher taxa). They appear with
           an incomplete classification path rather than being dropped.
         </p>
-        <p>The code is MIT licensed: <a href={REPO_URL} target="_blank" rel="noreferrer">source on GitHub</a>. Fork it and rebuild with a newer release.</p>
+        <p>Made by <a href="https://curtishoffmann.com/" target="_blank" rel="noreferrer">Curtis Hoffmann</a>. The code is MIT licensed: <a href={REPO_URL} target="_blank" rel="noreferrer">source on GitHub</a>. Fork it and rebuild with a newer release.</p>
       </section>
 
       <section className="panel">

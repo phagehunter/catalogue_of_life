@@ -10,7 +10,6 @@ import { isItalicRank, rankLabel } from '../data/labels.js'
 const MAX = 6
 const KEYS = ['a', 'b', 'c', 'd', 'e', 'f']
 const COLORS = ['var(--series-1)', 'var(--series-2)', 'var(--series-3)', 'var(--series-4)', 'var(--series-5)', 'var(--series-6)']
-const MAJOR = new Set(['domain', 'kingdom', 'phylum', 'class', 'order', 'family', 'genus', 'species', 'subspecies'])
 
 // Plain-language verdict by the rank of the deepest shared taxon.
 const VERDICT = {
@@ -137,7 +136,7 @@ export default function Compare() {
       {analysis && species.length >= 2 && chains.length === species.length ? (
         <>
           <Verdicts analysis={analysis} species={species} chains={chains} ranks={meta.ranks} />
-          <Cladogram analysis={analysis} species={species} chains={chains} ranks={meta.ranks} />
+          <ClassificationGrid analysis={analysis} species={species} chains={chains} ranks={meta.ranks} />
           <p style={{ textAlign: 'center' }}><button type="button" className="btn" onClick={share}>{copied ? '✓ Link copied' : 'Copy a link to this comparison'}</button></p>
         </>
       ) : null}
@@ -226,135 +225,199 @@ function Verdicts({ analysis, species, chains, ranks }) {
         {detail}
         {analysis.overall ? <>: they share <Link to={`/taxon/${encodeURIComponent(analysis.overall.id)}`} className={isItalicRank(analysis.overall.rank, ranks) ? 'sci' : ''}>{analysis.overall.name}</Link> ({rankLabel(analysis.overall.rank).toLowerCase()})</> : null}.
       </div>
-      {analysis.pairs.length > 1 ? (
-        <div className="pair-grid">
-          {analysis.pairs.map(({ i, j, mrca }) => {
-            const [w, d] = verdictFor(mrca?.rank)
-            return (
-              <div className="card pair" key={`${i}-${j}`}>
-                <div className="names">
-                  <span className="dot" style={{ background: COLORS[i] }} aria-hidden="true" /><span className="sci">{species[i].n}</span>
-                  <span className="vs">↔</span>
-                  <span className="dot" style={{ background: COLORS[j] }} aria-hidden="true" /><span className="sci">{species[j].n}</span>
-                </div>
-                <div><span className="word">{w}</span> <span className="detail">· {d}{mrca ? <>: <span className={isItalicRank(mrca.rank, ranks) ? 'sci' : ''}>{mrca.name}</span></> : null}</span></div>
-              </div>
-            )
-          })}
-        </div>
-      ) : null}
+      {analysis.pairs.length > 1 ? <PairMatrix analysis={analysis} species={species} ranks={ranks} /> : null}
     </section>
   )
 }
 
-// ---- cladogram ------------------------------------------------------------
+// ---- classification grid ----------------------------------------------------
+//
+// Rows are ranks, columns are the chosen organisms, ordered so organisms that
+// share a taxon sit next to each other. Adjacent cells holding the same taxon
+// merge into one wide cell, so the shared trunk and every split are visible at
+// a glance. Aligning by rank (not chain depth) avoids the false precision of a
+// depth-scaled tree: chains carry different numbers of intermediate ranks.
 
-const ROW = 72, LEFT = 30, RIGHT = 340, LEAF_GAP = 110, WIDTH = 1180
+const MAIN_RANKS = ['domain', 'kingdom', 'phylum', 'class', 'order', 'family', 'genus', 'species']
 
-function Cladogram({ analysis, species, chains, ranks }) {
-  const layout = useMemo(() => layoutTree(analysis.root, species.length), [analysis, species.length])
-  if (!layout) return null
-  const { leaves, edges, nodes, height } = layout
+function leafOrder(root) {
+  const order = []
+  ;(function visit(node) {
+    for (const idx of node.leaves) order.push(idx)
+    for (const c of node.children) visit(c)
+  })(root)
+  return order
+}
+
+function ClassificationGrid({ analysis, species, chains, ranks }) {
+  const [allRanks, setAllRanks] = useState(false)
+  const order = useMemo(() => leafOrder(analysis.root), [analysis])
+  const rankIndex = r => { const i = ranks.indexOf(r); return i < 0 ? ranks.length : i }
+
+  const rows = useMemo(() => {
+    const present = new Set()
+    for (const ch of chains) for (const n of ch.chain) if (n.rank && n.rank !== 'unranked') present.add(n.rank)
+    let list
+    if (allRanks) list = [...present]
+    else {
+      list = MAIN_RANKS.filter(r => present.has(r))
+      for (const sp of species) {
+        if (sp.rank && present.has(sp.rank) && !list.includes(sp.rank) && rankIndex(sp.rank) > rankIndex('species')) list.push(sp.rank)
+      }
+    }
+    return list.sort((a, b) => rankIndex(a) - rankIndex(b))
+  }, [chains, species, allRanks, ranks])
+
+  const grid = useMemo(() => {
+    const byRank = {}
+    for (const r of rows) {
+      const cells = []
+      for (let c = 0; c < order.length; c++) {
+        const idx = order[c]
+        const node = chains[idx].chain.find(n => n.rank === r) || null
+        const prev = cells[cells.length - 1]
+        if (node && prev && prev.taxon && prev.taxon.i === node.i) { prev.span++; prev.columns.push(idx); continue }
+        cells.push({ taxon: node, start: c, span: 1, columns: [idx], isLeaf: !!node && node.i === species[idx].i })
+      }
+      byRank[r] = cells
+    }
+    return byRank
+  }, [rows, order, chains, species])
+
+  // Intermediate ranks hidden between displayed rows, per organism.
+  const hidden = useMemo(() => {
+    if (allRanks) return {}
+    const out = {}
+    rows.forEach((r, i) => {
+      const lo = i === 0 ? -1 : rankIndex(rows[i - 1])
+      const hi = rankIndex(r)
+      out[r] = {}
+      for (const idx of order) out[r][idx] = chains[idx].chain.filter(n => n.rank && n.rank !== 'unranked' && rankIndex(n.rank) > lo && rankIndex(n.rank) < hi)
+    })
+    return out
+  }, [rows, order, chains, allRanks])
+
+  const overallId = analysis.overall?.id
+  // The deepest displayed row whose single cell spans every organism. When the
+  // true deepest shared group sits at a hidden intermediate rank, that row
+  // carries the gold marker and names it.
+  const deepestSharedRow = [...rows].reverse().find(r => grid[r].length === 1 && grid[r][0].taxon)
+  const mrcaVisible = rows.some(r => grid[r].some(c => c.taxon && c.taxon.i === overallId))
   return (
-    <section className="card clado-wrap">
-      <div className="clado-scroll">
-        <svg className="clado" viewBox={`0 0 ${WIDTH} ${height}`} role="img" aria-label={`Classification tree connecting ${species.map(s => s.n).join(', ')}`}>
-          {edges.map(e => <path key={e.id} className={'edge' + (e.shared ? ' shared' : '')} d={`M${e.x1} ${e.y1} V${e.y2} H${e.x2}`} />)}
-          {nodes.map(n => (
-            <g key={n.id}>
-              <circle className={'node' + (n.mrca ? ' mrca' : '')} cx={n.x} cy={n.y} r={n.mrca ? 5 : 2.5} />
-              {n.label ? (
-                <text className={'lbl' + (n.mrca ? ' mrca' : '')} x={n.x + 7} y={n.y + n.labelDy} textAnchor="start">
-                  <tspan className="rk">{rankLabel(n.rank)}</tspan>
-                  <tspan className="nm" dx="5">{n.name}</tspan>
-                </text>
-              ) : null}
-            </g>
-          ))}
-          {leaves.map(l => {
-            const sp = species[l.idx]
-            const x = WIDTH - RIGHT + LEAF_GAP
-            return (
-              <g key={l.idx}>
-                <line x1={l.x} y1={l.y} x2={x} y2={l.y} stroke={COLORS[l.idx]} strokeWidth="2" strokeDasharray="2 5" opacity=".7" />
-                <circle cx={x} cy={l.y} r="7" fill={COLORS[l.idx]} />
-                <a href={`${import.meta.env.BASE_URL.replace(/\/$/, '')}/taxon/${encodeURIComponent(sp.i)}`}>
-                  <text className="leaf-name" x={x + 16} y={l.y + 5}><tspan fontStyle={isItalicRank(sp.rank, ranks) ? 'italic' : 'normal'}>{sp.n}</tspan></text>
-                  {chains[l.idx]?.common ? <text className="leaf-common" x={x + 16} y={l.y + 21}>{chains[l.idx].common}</text> : null}
-                </a>
-              </g>
-            )
-          })}
-        </svg>
+    <section className="card grid-wrap">
+      <div className="grid-tools">
+        <h2 id="grid-heading">Where the classifications meet</h2>
+        <label className="small"><input type="checkbox" checked={allRanks} onChange={e => setAllRanks(e.target.checked)} /> Show every rank</label>
+      </div>
+      <div className="grid-scroll">
+        <table className="cgrid" aria-labelledby="grid-heading">
+          <thead>
+            <tr>
+              <th scope="col" className="rank-head"><span className="visually-hidden">Rank</span></th>
+              {order.map(idx => (
+                <th scope="col" key={idx}>
+                  <span className="dot" style={{ background: COLORS[idx] }} aria-hidden="true" />
+                  <span className={isItalicRank(species[idx].rank, ranks) ? 'sci' : ''}>{species[idx].n}</span>
+                  {chains[idx].common ? <span className="common">{chains[idx].common}</span> : null}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map(r => (
+              <tr key={r}>
+                <th scope="row" className="rank-head">{rankLabel(r)}</th>
+                {grid[r].map(cell => {
+                  const shared = cell.span > 1
+                  const t = cell.taxon
+                  const lists = cell.columns.map(idx => (hidden[r] && hidden[r][idx]) || [])
+                  const same = lists.every(l => l.length === lists[0].length && l.every((x, k) => x.i === lists[0][k].i))
+                  const note = same ? lists[0] : null
+                  const isMrca = !!t && (t.i === overallId || (!mrcaVisible && r === deepestSharedRow))
+                  const cls = ['cell', shared ? 'shared' : 'single', isMrca ? 'mrca' : '', cell.isLeaf ? 'leaf' : '', !t ? 'none' : ''].filter(Boolean).join(' ')
+                  return (
+                    <td key={`${r}-${cell.start}`} colSpan={cell.span} className={cls}
+                        style={!shared ? { '--c': COLORS[cell.columns[0]] } : undefined}>
+                      {t ? (
+                        <>
+                          <Link to={`/taxon/${encodeURIComponent(t.i)}`} className={isItalicRank(t.rank, ranks) ? 'sci' : ''}>{t.n}</Link>
+                          {shared ? <span className="tag">shared by {cell.span}</span> : null}
+                          {isMrca ? (
+                            <span className="tag gold">
+                              {t.i === overallId ? 'deepest shared group' : `deepest shared: ${analysis.overall.name} (${rankLabel(analysis.overall.rank).toLowerCase()}, hidden rank)`}
+                            </span>
+                          ) : null}
+                          {note && note.length ? (
+                            <span className="more" title={note.map(n => `${rankLabel(n.rank)}: ${n.n}`).join('\n')}>+{note.length} rank{note.length === 1 ? '' : 's'} above</span>
+                          ) : null}
+                        </>
+                      ) : <span className="muted" aria-label="not ranked at this level">—</span>}
+                    </td>
+                  )
+                })}
+              </tr>
+            ))}
+          </tbody>
+        </table>
       </div>
       <p className="clado-legend">
-        Left to right follows the classification from the top-level group down to each organism; each step is one rank, not a unit of time.
-        Gold circles mark the deepest groups shared by two or more of the chosen organisms. Only the main ranks are labelled.
+        Each row is a rank in the Catalogue of Life classification. A wide cell is a group the organisms above it share;
+        the gold cell is the deepest group all of them share. “+n ranks above” counts intermediate ranks (subclass, infraorder,
+        tribe…) hidden between rows; tick “Show every rank” to see them. This reflects expert classification, not a dated evolutionary tree.
       </p>
     </section>
   )
 }
 
-function layoutTree(root, n) {
-  if (!root || n < 2) return null
-  const leaves = []
-  ;(function visit(node) {
-    for (const idx of node.leaves) leaves.push({ idx, node })
-    for (const c of node.children) visit(c)
-  })(root)
-  leaves.forEach((l, i) => { l.y = 48 + i * ROW })
-  ;(function assignY(node) {
-    const ys = []
-    ;(function collect(nd) {
-      for (const idx of nd.leaves) { const l = leaves.find(L => L.node === nd && L.idx === idx); if (l) ys.push(l.y) }
-      for (const c of nd.children) collect(c)
-    })(node)
-    node.y = ys.length ? (Math.min(...ys) + Math.max(...ys)) / 2 : 0
-    for (const c of node.children) assignY(c)
-  })(root)
-  let maxDepth = 1
-  ;(function md(node) { maxDepth = Math.max(maxDepth, node.depth); for (const c of node.children) md(c) })(root)
-  const inner = WIDTH - LEFT - RIGHT
-  ;(function assignX(node) {
-    node.x = node === root ? LEFT : LEFT + (node.depth / maxDepth) * inner
-    for (const c of node.children) assignX(c)
-  })(root)
-  const edges = [], nodes = []
-  ;(function walk(node) {
-    if (node !== root) nodes.push(node)
-    for (const c of node.children) {
-      edges.push({ id: `${node.id}__${c.id}`, x1: node.x, y1: node.y, x2: c.x, y2: c.y, shared: c.passing.size >= 2 })
-      walk(c)
-    }
-  })(root)
-  for (const nd of nodes) {
-    nd.mrca = nd.passing.size >= 2 && nd.children.length > 1
-    // Terminal nodes are named by the leaf label on the right.
-    const terminal = nd.children.length === 0 && nd.leaves.length > 0
-    nd.label = !terminal && (MAJOR.has(nd.rank) || nd.mrca)
-  }
-  // Collision handling: labelled nodes on one horizontal line are placed in
-  // up to four lanes (above, below, higher, lower). A lane is free when the
-  // previous label in it ends before this node starts.
-  const approxWidth = nd => 14 + (nd.rank ? nd.rank.length * 5.6 : 0) + nd.name.length * 6.6
-  const LANES = [-9, 20, -24, 35]
-  const byY = new Map()
-  for (const nd of nodes) if (nd.label) { const k = Math.round(nd.y); if (!byY.has(k)) byY.set(k, []); byY.get(k).push(nd) }
-  for (const line of byY.values()) {
-    line.sort((a, b) => a.x - b.x || b.depth - a.depth)
-    const laneEnd = LANES.map(() => -Infinity)
-    for (const nd of line) {
-      let lane = laneEnd.findIndex(end => end < nd.x + 7)
-      if (lane < 0) {
-        // No free lane: drop the least important label (non-MRCA, minor rank)
-        if (!nd.mrca && !['domain', 'kingdom', 'phylum', 'class', 'order', 'family', 'genus', 'species'].includes(nd.rank)) { nd.label = false; continue }
-        lane = laneEnd.indexOf(Math.min(...laneEnd))
-      }
-      nd.labelDy = LANES[lane]
-      laneEnd[lane] = nd.x + 7 + approxWidth(nd)
-    }
-  }
-  leaves.forEach(l => { l.x = l.node.x })
-  const height = 48 + leaves.length * ROW + 12
-  return { leaves, edges, nodes, height }
+// ---- pairwise matrix --------------------------------------------------------
+
+function PairMatrix({ analysis, species, ranks }) {
+  const lookup = new Map(analysis.pairs.map(p => [`${p.i}-${p.j}`, p.mrca]))
+  const level = m => m ? MAIN_RANKS.indexOf(nearestMain(m.rank, ranks)) : 0
+  return (
+    <div className="matrix-wrap">
+      <table className="matrix" aria-label="Pairwise relatedness">
+        <thead>
+          <tr>
+            <th scope="col"><span className="visually-hidden">Organism</span></th>
+            {species.slice(1).map((s, jj) => (
+              <th scope="col" key={s.i}><span className="dot" style={{ background: COLORS[jj + 1] }} aria-hidden="true" /><span className="sci">{shortName(s.n)}</span></th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {species.slice(0, -1).map((a, i) => (
+            <tr key={a.i}>
+              <th scope="row"><span className="dot" style={{ background: COLORS[i] }} aria-hidden="true" /><span className="sci">{shortName(a.n)}</span></th>
+              {species.slice(1).map((b, jj) => {
+                const j = jj + 1
+                if (j <= i) return <td key={b.i} className="blank" aria-hidden="true" />
+                const m = lookup.get(`${i}-${j}`)
+                const [word] = verdictFor(m?.rank)
+                return (
+                  <td key={b.i} className="pair-cell" style={{ '--lvl': level(m) }}>
+                    <span className="word">{word}</span>
+                    {m ? <span className={'grp' + (isItalicRank(m.rank, ranks) ? ' sci' : '')}>{m.name}</span> : null}
+                  </td>
+                )
+              })}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+function shortName(n) {
+  const parts = n.split(' ')
+  return parts.length > 1 ? `${parts[0][0]}. ${parts.slice(1).join(' ')}` : n
+}
+
+// Nearest main rank at or above the given rank, for the matrix colour steps.
+function nearestMain(rank, ranks) {
+  const idx = ranks.indexOf(rank)
+  let best = 'domain'
+  for (const m of MAIN_RANKS) if (ranks.indexOf(m) <= idx) best = m
+  return best
 }
