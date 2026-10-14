@@ -267,28 +267,43 @@ main { flex: 1; width: 100%; max-width: var(--maxw); margin: 0 auto; padding: va
 .verdict .label { font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: .08em; color: var(--ink-3); }
 .verdict .word { font-size: clamp(1.5rem, 3.4vw, 2.2rem); font-weight: 700; color: var(--accent-strong); margin: .2rem 0 .3rem; }
 .verdict .detail { color: var(--ink-2); }
-.pair-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: var(--sp-3); margin-top: var(--sp-4); text-align: left; }
-.pair { padding: .75rem .9rem; display: grid; gap: .3rem; }
-.pair .names { display: flex; align-items: center; gap: .4rem; flex-wrap: wrap; font-size: var(--fs-sm); }
-.pair .vs { color: var(--ink-3); }
-.pair .word { font-weight: 700; color: var(--accent-strong); }
-.pair .detail { color: var(--ink-3); font-size: var(--fs-sm); }
 .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; flex: none; }
-.clado-wrap { padding: var(--sp-3) var(--sp-2) var(--sp-4); margin-bottom: var(--sp-4); }
-.clado-scroll { overflow-x: auto; padding: 0 var(--sp-2); }
-.clado { display: block; width: 100%; min-width: 640px; height: auto; }
-.clado .edge { fill: none; stroke: var(--line-strong); stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
-.clado .edge.shared { stroke: var(--accent); stroke-width: 2.5; }
-.clado .node { fill: var(--line-strong); }
-.clado .node.mrca { fill: var(--gold); stroke: var(--gold-soft); stroke-width: 4; }
-.clado .lbl { font-size: 11px; fill: var(--ink-3); font-family: var(--font); }
-.clado .lbl .rk { font-size: 9px; letter-spacing: .06em; text-transform: uppercase; }
-.clado .lbl .nm { fill: var(--ink-2); font-style: italic; font-size: 12px; }
-.clado .lbl.mrca .nm { fill: var(--gold); font-weight: 700; }
-.clado .leaf-name { font-size: 14px; fill: var(--ink); font-family: var(--font); }
-.clado .leaf-common { font-size: 11px; fill: var(--ink-2); font-family: var(--font); }
-.clado a:hover .leaf-name { fill: var(--accent); }
-.clado-legend { color: var(--ink-3); font-size: var(--fs-sm); padding: var(--sp-3) var(--sp-2) 0; border-top: 1px dashed var(--line); margin-top: var(--sp-2); }
+.clado-legend { color: var(--ink-3); font-size: var(--fs-sm); padding: var(--sp-3) 0 0; border-top: 1px dashed var(--line); margin: var(--sp-3) 0 0; }
+
+/* Classification grid */
+.grid-wrap { padding: var(--sp-4) var(--sp-5); margin-bottom: var(--sp-4); }
+.grid-tools { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: var(--sp-3); }
+.grid-tools h2 { font-size: var(--fs-lg); margin: 0; }
+.grid-tools label { display: inline-flex; align-items: center; gap: .4rem; color: var(--ink-2); }
+.grid-scroll { overflow-x: auto; margin: var(--sp-3) calc(-1 * var(--sp-2)) 0; padding: 0 var(--sp-2); }
+.cgrid { border-collapse: separate; border-spacing: 4px 4px; width: 100%; min-width: 560px; font-size: var(--fs-sm); }
+.cgrid th, .cgrid td { text-align: left; vertical-align: top; }
+.cgrid thead th { position: sticky; top: 0; background: var(--surface); padding: .4rem .6rem .5rem; font-weight: 650; min-width: 150px; border-bottom: 2px solid var(--line); z-index: 1; }
+.cgrid thead th .dot { margin-right: .4rem; vertical-align: middle; }
+.cgrid thead th .common { display: block; color: var(--ink-2); font-weight: 400; font-size: var(--fs-xs); margin-left: 1.05rem; }
+.cgrid .rank-head { position: sticky; left: 0; background: var(--surface); color: var(--ink-3); font-weight: 600; font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: .06em; padding: .55rem .6rem .55rem 0; white-space: nowrap; min-width: 0; border: none; z-index: 1; }
+.cgrid td.cell { background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: .45rem .65rem; }
+.cgrid td.cell a { color: var(--ink); text-decoration: none; font-weight: 550; }
+.cgrid td.cell a:hover { text-decoration: underline; }
+.cgrid td.shared { background: var(--accent-soft); border-color: transparent; text-align: center; }
+.cgrid td.single { border-left: 3px solid var(--c, var(--line-strong)); }
+.cgrid td.mrca { outline: 2px solid var(--gold); outline-offset: -1px; }
+.cgrid td.leaf a { font-weight: 700; }
+.cgrid td.none { background: transparent; border-style: dashed; color: var(--ink-3); text-align: center; }
+.cgrid .tag { display: inline-block; margin-left: .5rem; font-size: var(--fs-xs); color: var(--ink-3); }
+.cgrid .tag.gold { color: var(--gold); font-weight: 600; }
+.cgrid .more { display: block; font-size: var(--fs-xs); color: var(--ink-3); margin-top: .15rem; cursor: help; text-decoration: underline dotted; }
+
+/* Pairwise matrix */
+.matrix-wrap { overflow-x: auto; margin-top: var(--sp-4); }
+.matrix { border-collapse: separate; border-spacing: 4px; margin: 0 auto; font-size: var(--fs-sm); text-align: left; }
+.matrix th { font-weight: 550; color: var(--ink-2); padding: .3rem .5rem; white-space: nowrap; }
+.matrix th .dot { margin-right: .35rem; vertical-align: middle; }
+.matrix td.blank { background: transparent; }
+.matrix td.pair-cell { border-radius: var(--radius-sm); padding: .45rem .7rem; min-width: 130px; border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--accent) calc(var(--lvl) * 9%), var(--surface-2)); }
+.verdict .matrix .word { display: block; font-weight: 650; color: var(--ink); font-size: var(--fs-md); margin: 0; }
+.verdict .matrix .grp { display: block; color: var(--ink-2); font-size: var(--fs-xs); }
 .preset-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: var(--sp-3); }
 .preset { text-align: left; padding: .9rem 1rem; cursor: pointer; transition: border-color var(--ease); }
 .preset:hover { border-color: var(--accent); }

@@ -337,7 +337,7 @@ def create_schema(conn: sqlite3.Connection) -> None:
         );
         CREATE TABLE vernacular (
             taxon_id TEXT, name TEXT, language TEXT, preferred INTEGER,
-            prio INTEGER, shard INTEGER
+            prio INTEGER, shard INTEGER, source_id TEXT
         );
         CREATE TABLE distribution (
             taxon_id TEXT, area TEXT, area_id TEXT, gazetteer TEXT,
@@ -409,13 +409,13 @@ def load_vernacular(conn, path: Path, limit) -> int:
         lang = (row.get("language") or "").strip().lower() or None
         pref = truthy(row.get("preferred"))
         batch.append((tid, name, lang, pref, vern_priority(lang, pref),
-                      shard_for(tid, CORE_SHARDS)))
+                      shard_for(tid, CORE_SHARDS), (row.get("sourceID") or "").strip() or None))
         if len(batch) >= INSERT_BATCH:
-            cur.executemany("INSERT INTO vernacular VALUES (?,?,?,?,?,?)", batch)
+            cur.executemany("INSERT INTO vernacular VALUES (?,?,?,?,?,?,?)", batch)
             total += len(batch)
             batch.clear()
     if batch:
-        cur.executemany("INSERT INTO vernacular VALUES (?,?,?,?,?,?)", batch)
+        cur.executemany("INSERT INTO vernacular VALUES (?,?,?,?,?,?,?)", batch)
         total += len(batch)
     conn.commit()
     return total
@@ -508,8 +508,16 @@ def build_counts(conn) -> None:
         FROM taxa WHERE parent_id IS NOT NULL GROUP BY parent_id;
         CREATE UNIQUE INDEX idx_counts ON counts(id);
 
+        -- Source coverage: how many vernacular rows each source contributes.
+        -- Used to break ties between equally-ranked common names, so a name
+        -- from a broad source (e.g. a global checklist) outranks a one-off.
+        CREATE TABLE vsrc AS
+        SELECT source_id, COUNT(*) AS n FROM vernacular GROUP BY source_id;
+        CREATE UNIQUE INDEX idx_vsrc ON vsrc(source_id);
+
         CREATE TABLE vcounts AS
-        SELECT taxon_id AS id, COUNT(*) AS nv FROM vernacular GROUP BY taxon_id;
+        SELECT taxon_id AS id, COUNT(DISTINCT name || '|' || COALESCE(language, '')) AS nv
+        FROM vernacular GROUP BY taxon_id;
         CREATE UNIQUE INDEX idx_vcounts ON vcounts(id);
 
         CREATE TABLE dcounts AS
@@ -656,10 +664,16 @@ def emit_detail(conn, out_dir: Path) -> None:
                                    d: [[area, areaId, gazetteer, establishment, threat]…]}}"""
     for shard in range(CORE_SHARDS):
         bucket: dict[str, dict] = {}
+        # One row per distinct (name, language); the number of sources that
+        # list a name ranks it, so "Tiger" beats a one-off "Bagh" among the
+        # preferred English names.
         last, n = None, 0
-        for tid, name, lang, pref in conn.execute(
-                """SELECT taxon_id, name, language, preferred FROM vernacular
-                   WHERE shard = ? ORDER BY taxon_id, prio, language, name""", (shard,)):
+        for tid, name, lang, pref, sources in conn.execute(
+                """SELECT v.taxon_id, v.name, v.language, MAX(v.preferred), COUNT(*) AS sources
+                   FROM vernacular v LEFT JOIN vsrc s ON s.source_id = v.source_id
+                   WHERE v.shard = ?
+                   GROUP BY v.taxon_id, v.name, v.language
+                   ORDER BY v.taxon_id, MIN(v.prio), sources DESC, MAX(COALESCE(s.n, 0)) DESC, v.name""", (shard,)):
             if tid != last:
                 last, n = tid, 0
             n += 1

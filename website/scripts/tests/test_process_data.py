@@ -27,12 +27,16 @@ NAME_USAGE = [
     ("O1", "NOPE", "accepted", "Orphanus", "", "genus", "", "", "", "", "false"),
 ]
 VERNACULAR = [
-    ("col:taxonID", "col:name", "col:language", "col:preferred"),
-    ("S1", "Tigre", "fra", "true"),
-    ("S1", "Tiger", "eng", "true"),
-    ("S1", "Bengal tiger", "eng", "false"),
-    ("S1", "虎", "zho", "false"),
-    ("G1", "Big cats", "eng", "true"),
+    ("col:taxonID", "col:sourceID", "col:name", "col:language", "col:preferred"),
+    ("S1", "big", "Tigre", "fra", "true"),
+    ("S1", "small", "Bagh", "eng", ""),          # one-off regional source
+    ("S1", "big", "Tiger", "eng", ""),           # broad source wins the tie
+    ("S1", "big", "Bengal tiger", "eng", "false"),
+    ("S1", "big", "Tiger", "eng", "false"),      # duplicate row: collapsed
+    ("S1", "big", "虎", "zho", "false"),
+    ("G1", "big", "Big cats", "eng", "true"),
+    ("S2", "big", "Lion", "eng", "true"),
+    ("S3", "big", "American lion", "eng", "true"),
 ]
 DISTRIBUTION = [
     ("col:taxonID", "col:areaID", "col:area", "col:gazetteer", "col:establishmentMeans", "col:threatStatus"),
@@ -119,7 +123,7 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(s1["p"], "G1")
         self.assertEqual(s1["nc"], 2)             # BIN + subspecies are accepted children
         self.assertEqual(s1["ns"], 1)             # Felis tigris
-        self.assertEqual(s1["nv"], 4)
+        self.assertEqual(s1["nv"], 5)             # distinct names, duplicate collapsed
         self.assertEqual(s1["nd"], 2)
         self.assertEqual(s1["l"], [0, "3"])       # dictionary-encoded link
         self.assertNotIn("x", s1)
@@ -145,7 +149,7 @@ class EndToEndTests(unittest.TestCase):
 
     def test_detail(self):
         d = self.load(f"detail/{pd.shard_for('S1', pd.CORE_SHARDS)}.json")["S1"]
-        self.assertEqual([v[0] for v in d["v"]], ["Tiger", "Bengal tiger", "Tigre", "虎"])  # eng preferred first
+        self.assertEqual([v[0] for v in d["v"]], ["Tiger", "Bengal tiger", "Bagh", "Tigre", "虎"])  # eng first; broad source outranks one-off
         self.assertEqual(len(d["d"]), 2)
         self.assertEqual(d["d"][1][1], "RU")      # kept via areaID
 
