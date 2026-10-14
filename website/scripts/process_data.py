@@ -1,98 +1,133 @@
+#!/usr/bin/env python3
 """
-Catalogue of Life — Static Data Processor
-==========================================
+Catalogue of Life — Static Data Processor (schema v2)
+=====================================================
 
-Reads the raw TSV files from the Catalogue of Life data package and emits a
-sharded, static, gzippable JSON tree that the React frontend consumes.
+Reads a Catalogue of Life ColDP export (NameUsage.tsv, VernacularName.tsv,
+Distribution.tsv, metadata.yaml) and emits the static JSON the React
+frontend consumes.  Everything streams through an on-disk SQLite scratch
+database; nothing large is held in Python memory.
 
-Design goals:
-  1. Stream every TSV with the stdlib ``csv`` module so memory stays small.
-  2. Use an on-disk SQLite database as scratch space (paged, ~tens of MB RAM).
-  3. Emit "sharded" JSON files (1024 buckets) so the browser only pulls a
-     small slice per click.
-  4. Tolerate orphan records (parentID points to nothing) and missing ranks.
+Output layout  (all paths relative to --output)
 
-CLI:
-    python process_data.py --input <raw_tsv_dir> --output <site_data_dir>
-                           [--limit N]   # for fast smoke tests
-                           [--keep-db]   # keep the scratch SQLite for inspection
+    meta.json                     dataset citation, counts, roots, shard config
+    taxa/<0..CORE_SHARDS-1>.json  core records keyed by ID (name, rank, status,
+                                  parent, counts) — small, one fetch per page
+    higher/<0..HIGHER_SHARDS-1>.json
+                                  supra-specific accepted taxa with their full
+                                  ancestor chain inline, so a species page needs
+                                  at most one extra fetch for its breadcrumb
+    detail/<0..CORE_SHARDS-1>.json
+                                  vernacular names + distribution, keyed by ID
+    kids/<0..KIDS_SHARDS-1>.json  first page of children per parent (accepted
+                                  children and synonyms listed separately)
+    kids/p/<parentId>-c<n>.json   overflow pages for parents with many children
+    kids/p/<parentId>-s<n>.json   overflow pages for parents with many synonyms
+    search/manifest.json          adaptive prefix trie: which shard answers a query
+    search/<prefix>.json          search entries [id, name, rank, kind, matched]
+
+CLI
+    python process_data.py --input <dir> --output <dir> [--limit N] [--keep-db]
+                           [--include-bins]
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
-import gzip
+import io
 import json
-import os
 import re
 import shutil
 import sqlite3
 import sys
 import time
+import unicodedata
 from contextlib import contextmanager
 from pathlib import Path
 
-# ---------------------------------------------------------------------------
-# CSV is built for ~1KB cells; CoL has long reference fields. Push the limit.
 csv.field_size_limit(sys.maxsize)
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Configuration — the frontend mirrors every constant in src/data/config.js
 # ---------------------------------------------------------------------------
 
-# Number of shards for taxa / children / search index. 1024 keeps each shard
-# file under ~500KB for the full Catalogue of Life (~5M records).
-NUM_SHARDS = 1024
+SCHEMA_VERSION = 2
 
-# Batch size for SQLite inserts. Larger = faster but more transient memory.
-INSERT_BATCH = 20000
+CORE_SHARDS = 4096      # taxa/ and detail/
+HIGHER_SHARDS = 512     # higher/
+KIDS_SHARDS = 1024      # kids/ (hashed on the PARENT id)
 
-# Vernacular names per taxon kept in the static record. Anything beyond this
-# is rare and just bloats the file size.
-MAX_VERNACULARS_PER_TAXON = 8
+KIDS_PAGE = 120         # children per page (inline first page + overflow pages)
+MAX_VERNACULARS = 40
+MAX_DISTRIBUTION = 100
 
-# Distribution areas per taxon kept in the static record.
-MAX_DISTRIBUTION_PER_TAXON = 30
+SEARCH_SHARD_LIMIT = 6000     # a prefix shard larger than this is split further
+SEARCH_SUMMARY_LIMIT = 1500   # top entries kept for a prefix that was split
+SEARCH_MAX_PREFIX = 8
+SEARCH_MIN_TOKEN = 4          # extra index entries for words this long or longer
 
-# Lineage ranks (denormalised in NameUsage.tsv) — promoted to first-class
-# fields in each emitted record so the breadcrumb works without a tree walk.
-LINEAGE_RANKS = (
-    "kingdom", "phylum", "class", "order", "family",
-    "genus", "species",
-)
+INSERT_BATCH = 50000
 
-# All ranks recognised by Catalogue of Life, ordered from broad to narrow.
+ACCEPTED_STATUSES = ("accepted", "provisionally accepted")
+
+# Every rank Catalogue of Life / ChecklistBank uses, broad → narrow.
 RANK_ORDER = [
-    "unranked", "domain", "superkingdom", "kingdom", "subkingdom",
-    "infrakingdom", "superphylum", "phylum", "subphylum", "infraphylum",
-    "parvphylum", "microphylum", "nanophylum", "claudius", "gigaclass",
-    "megaclass", "superclass", "class", "subclass", "infraclass",
+    "unranked", "domain", "realm", "subrealm", "superkingdom", "kingdom",
+    "subkingdom", "infrakingdom", "superphylum", "phylum", "subphylum",
+    "infraphylum", "parvphylum", "microphylum", "nanophylum", "claudius",
+    "gigaclass", "megaclass", "superclass", "class", "subclass", "infraclass",
     "subterclass", "parvclass", "superdivision", "division", "subdivision",
     "infradivision", "superlegion", "legion", "sublegion", "infralegion",
     "supercohort", "cohort", "subcohort", "infracohort", "gigaorder",
-    "magnorder", "grandorder", "mirorder", "superorder", "order",
-    "nanorder", "hyporder", "minorder", "suborder", "infraorder",
-    "parvorder", "supersection", "section", "subsection", "superfamily",
-    "epifamily", "family", "subfamily", "infrafamily", "supertribe",
-    "tribe", "subtribe", "infratribe", "suprageneric_name", "genus",
-    "subgenus", "infragenus", "supersubgenus", "supersection_botany",
-    "section_botany", "subsection_botany", "series", "subseries",
-    "infrageneric_name", "species_aggregate", "species", "infraspecific_name",
-    "grex", "subspecies", "cultivar_group", "convariety", "infrasubspecific_name",
-    "proles", "natio", "aberration", "morph", "variety", "subvariety",
-    "form", "subform", "pathovar", "biovar", "chemovar", "morphovar",
-    "phagovar", "serovar", "chemoform", "forma_specialis", "lusus",
-    "cultivar", "mutatio", "strain", "other",
+    "magnorder", "grandorder", "mirorder", "superorder", "order", "nanorder",
+    "hyporder", "minorder", "suborder", "infraorder", "parvorder",
+    "supersection", "section", "subsection", "superfamily", "epifamily",
+    "family", "subfamily", "infrafamily", "supertribe", "tribe", "subtribe",
+    "infratribe", "suprageneric name", "genus", "subgenus", "infragenus",
+    "supersubgenus", "supersection botany", "section botany",
+    "subsection botany", "series", "subseries", "infrageneric name",
+    "species aggregate", "species", "infraspecific name", "grex",
+    "subspecies", "cultivar group", "convariety", "infrasubspecific name",
+    "proles", "natio", "aberration", "morph", "variety", "subvariety", "form",
+    "subform", "pathovar", "biovar", "chemovar", "morphovar", "phagovar",
+    "serovar", "chemoform", "forma specialis", "lusus", "cultivar", "mutatio",
+    "strain", "other",
 ]
+RANK_INDEX = {r: i for i, r in enumerate(RANK_ORDER)}
+SPECIES_INDEX = RANK_INDEX["species"]
+
+# Status codes used in every emitted record (0 is omitted = accepted).
+STATUS_ORDER = ["accepted", "provisionally accepted", "synonym",
+                "ambiguous synonym", "misapplied", "bare name"]
+STATUS_CODE = {st: i for i, st in enumerate(STATUS_ORDER)}
+
+
+def rank_code(rank: str) -> int:
+    return RANK_INDEX.get(rank, RANK_INDEX["other"])
+
+
+def status_code(status: str) -> int:
+    return STATUS_CODE.get(status, len(STATUS_ORDER) - 1)
+
+# Search ranking: lower is better.  Ranks people actually search for first.
+RANK_WEIGHT = {
+    "domain": 0, "kingdom": 0, "phylum": 0, "class": 0, "order": 0,
+    "family": 0, "genus": 0, "species": 1, "subfamily": 2, "tribe": 2,
+    "subgenus": 2, "subspecies": 2, "variety": 2, "form": 2,
+}
+LINK_PREFIX_MIN = 500   # a URL prefix shared by this many links gets a dictionary slot
+KIND_SCI_ACCEPTED = 0
+KIND_VERNACULAR = 1
+KIND_SCI_PROVISIONAL = 2
+KIND_SCI_SYNONYM = 3
+KIND_TOKEN = 4          # matched on an inner word (epithet or vernacular word)
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-
 def log(msg: str) -> None:
-    """Timestamped console log so the GitHub Actions log is readable."""
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
@@ -100,118 +135,174 @@ def log(msg: str) -> None:
 def step(label: str):
     log(f">>> {label}")
     t0 = time.time()
-    yield
-    log(f"<<< {label} ({time.time() - t0:.1f}s)")
+    try:
+        yield
+    finally:
+        log(f"<<< {label} ({time.time() - t0:.1f}s)")
 
 
-def shard_for(record_id: str) -> int:
-    """Stable, fast hash → shard bucket. Same algorithm in Python and JS."""
+def djb2(text: str) -> int:
+    """djb2 over UTF-16 code units, identical to the JS implementation.
+    CoL IDs are ASCII so BMP/UTF-16 subtleties never arise, but we encode
+    explicitly so the two sides agree even for exotic ids."""
+    h = 5381
+    data = text.encode("utf-16-le")
+    for i in range(0, len(data), 2):
+        unit = data[i] | (data[i + 1] << 8)
+        h = ((h << 5) + h + unit) & 0xFFFFFFFF
+    return h
+
+
+def shard_for(record_id: str, shards: int) -> int:
     if not record_id:
         return 0
-    h = 5381
-    for ch in record_id:
-        h = ((h << 5) + h + ord(ch)) & 0xFFFFFFFF  # h * 33 + ch
-    return h % NUM_SHARDS
+    return djb2(record_id) % shards
 
 
-def normalise_search(text: str) -> str:
-    """Lowercase + strip diacritics-ish + collapse whitespace.
-
-    Pure ASCII only; we avoid the unicodedata import to keep this file lean
-    and predictable. Non-ASCII is preserved (dropping diacritics would lose
-    important data here)."""
-    return re.sub(r"\s+", " ", (text or "").lower()).strip()
+def truthy(value) -> int:
+    return 1 if (value or "").strip().lower() in ("true", "1", "yes", "y") else 0
 
 
-def search_prefix(text: str) -> str:
-    """First two letters used to bucket the search index."""
-    norm = normalise_search(text)
-    if not norm:
-        return "_"
-    a = norm[0] if norm[0].isalnum() else "_"
-    b = norm[1] if len(norm) > 1 and norm[1].isalnum() else "_"
-    return a + b
+def normalise(text: str) -> str:
+    """Lowercase, strip diacritics, keep letters/digits/space/hyphen,
+    collapse whitespace.  Used for search keys and query matching
+    (mirrored in the frontend)."""
+    if not text:
+        return ""
+    t = unicodedata.normalize("NFKD", text)
+    t = "".join(ch for ch in t if not unicodedata.combining(ch))
+    t = t.lower()
+    t = re.sub(r"[^0-9a-zÀ-\uffff\s-]+", " ", t)
+    return re.sub(r"\s+", " ", t).strip()
 
 
-def write_json(path: Path, data, *, gzip_too: bool = False) -> None:
+def prefix_filename(prefix: str) -> str:
+    """Prefix → safe file stem. ASCII alnum stays; anything else is uXXXX."""
+    out = []
+    for ch in prefix:
+        if ch.isascii() and ch.isalnum():
+            out.append(ch)
+        elif ch == " ":
+            out.append("_")
+        elif ch == "-":
+            out.append("-")
+        else:
+            out.append("u%04x" % ord(ch))
+    return "".join(out)
+
+
+def write_json(path: Path, data) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
-    path.write_text(payload, encoding="utf-8")
-    if gzip_too:
-        with gzip.open(path.with_suffix(path.suffix + ".gz"), "wb",
-                       compresslevel=6) as gz:
-            gz.write(payload.encode("utf-8"))
+    path.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")),
+                    encoding="utf-8")
+
+
+def link_prefix(link: str) -> str:
+    """Everything up to and including the last '=' (query links) or the last
+    '/' (path links).  Links sharing a prefix are stored as [index, suffix]."""
+    cut = max(link.rfind("="), link.rfind("/"))
+    return link[:cut + 1] if cut > 8 else link
+
+
+def is_bin(name: str) -> bool:
+    return bool(name) and name.startswith("BOLD:")
 
 
 # ---------------------------------------------------------------------------
-# Split-file reassembly
-# ---------------------------------------------------------------------------
-#
-# GitHub Releases cap individual file uploads at 2 GB, but the full
-# NameUsage.tsv from the Catalogue of Life dump is ~2.4 GB. The recommended
-# workflow is to split it first with the standard ``split`` command:
-#
-#     split -b 1500m NameUsage.tsv NameUsage_part_
-#
-# That produces ``NameUsage_part_aa`` and ``NameUsage_part_ab`` (and possibly
-# more). When concatenated in alphabetical order they are byte-identical to
-# the original. The CI workflow does this with ``cat`` before invoking us,
-# but we duplicate the logic here so the script also Just Works when run
-# locally with only the split parts on disk.
-
-
-def reassemble_split(in_dir: Path, base_name: str) -> Path | None:
-    """If ``<base_name>.tsv`` is missing but ``<base_name>_part_*`` files exist,
-    concatenate them into ``<base_name>.tsv`` and return its path. Files are
-    joined in lexicographic order (matching ``split``'s ``aa``/``ab`` /
-    ``ac`` / … suffixing). Returns ``None`` if neither exists."""
-    target = in_dir / f"{base_name}.tsv"
-    if target.exists():
-        return target
-    parts = sorted(in_dir.glob(f"{base_name}_part_*"))
-    if not parts:
-        return None
-    log(f"  reassembling {len(parts)} split parts → {target.name}")
-    with target.open("wb") as out:
-        for p in parts:
-            log(f"    + {p.name} ({p.stat().st_size / 1e9:.2f} GB)")
-            with p.open("rb") as fh:
-                shutil.copyfileobj(fh, out, length=16 * 1024 * 1024)
-    log(f"  ✓ combined size: {target.stat().st_size / 1e9:.2f} GB")
-    return target
-
-
-# ---------------------------------------------------------------------------
-# TSV streamers — never load full files into memory.
+# Input handling
 # ---------------------------------------------------------------------------
 
+class ChainedRaw(io.RawIOBase):
+    """Read several files as one byte stream, so a NameUsage.tsv that was
+    split with `split -b` can be streamed without writing the 2.6 GB
+    reassembled copy to disk."""
 
-def iter_tsv(path: Path, limit: int | None = None):
-    """Yield each TSV row as a dict. Handles missing files gracefully."""
-    if not path.exists():
-        log(f"  ! {path.name} not found; skipping.")
+    def __init__(self, paths):
+        self._paths = list(paths)
+        self._idx = 0
+        self._fh = open(self._paths[0], "rb") if self._paths else None
+
+    def readable(self):
+        return True
+
+    def readinto(self, b):
+        while self._fh is not None:
+            n = self._fh.readinto(b)
+            if n:
+                return n
+            self._fh.close()
+            self._idx += 1
+            self._fh = open(self._paths[self._idx], "rb") if self._idx < len(self._paths) else None
+        return 0
+
+    def close(self):
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
+        super().close()
+
+
+def name_usage_sources(in_dir: Path) -> list[Path]:
+    """NameUsage.tsv if present, otherwise the split parts in order."""
+    whole = in_dir / "NameUsage.tsv"
+    if whole.exists():
+        return [whole]
+    parts = sorted(in_dir.glob("NameUsage_part_*"))
+    if parts:
+        log(f"  streaming {len(parts)} split parts: {', '.join(p.name for p in parts)}")
+    return parts
+
+
+def iter_tsv(source, limit: int | None = None):
+    """Yield each TSV row as a dict.  `source` is a Path or a list of Paths
+    that together form one file."""
+    paths = [source] if isinstance(source, Path) else list(source)
+    paths = [p for p in paths if p.exists()]
+    if not paths:
+        name = source.name if isinstance(source, Path) else "NameUsage.tsv"
+        log(f"  ! {name} not found; skipping.")
         return
-    with path.open("r", encoding="utf-8", newline="") as f:
+    raw = ChainedRaw(paths)
+    with io.TextIOWrapper(io.BufferedReader(raw, 1 << 20), encoding="utf-8",
+                          errors="replace", newline="") as f:
         reader = csv.reader(f, delimiter="\t", quoting=csv.QUOTE_NONE)
         try:
             header = next(reader)
         except StopIteration:
             return
-        # Strip the "col:" / "clb:" prefixes used in the Catalogue of Life TSVs
         cleaned = [h.split(":", 1)[-1] for h in header]
+        width = len(cleaned)
         for i, row in enumerate(reader):
             if limit is not None and i >= limit:
                 return
-            # Tolerate ragged rows (some lines have trailing missing columns).
-            if len(row) < len(cleaned):
-                row = row + [""] * (len(cleaned) - len(row))
+            if len(row) < width:
+                row = row + [""] * (width - len(row))
             yield dict(zip(cleaned, row))
 
 
-# ---------------------------------------------------------------------------
-# Phase 1 — load TSVs into SQLite scratch DB
-# ---------------------------------------------------------------------------
+def read_metadata(in_dir: Path) -> dict:
+    """Pull citation fields out of metadata.yaml without a YAML dependency.
+    Only simple top-level `key: value` lines are needed."""
+    meta = {"title": "Catalogue of Life", "alias": None, "version": None,
+            "issued": None, "doi": None, "license": None}
+    path = in_dir / "metadata.yaml"
+    if not path.exists():
+        return meta
+    wanted = set(meta)
+    with path.open("r", encoding="utf-8", errors="replace") as f:
+        for _ in range(400):
+            line = f.readline()
+            if not line:
+                break
+            m = re.match(r"^([a-zA-Z]+):\s*(.+?)\s*$", line)
+            if m and m.group(1) in wanted and meta.get(m.group(1)) in (None, "Catalogue of Life"):
+                meta[m.group(1)] = m.group(2).strip().strip('"').strip("'")
+    return meta
 
+
+# ---------------------------------------------------------------------------
+# Phase 1 — load into SQLite
+# ---------------------------------------------------------------------------
 
 def init_db(db_path: Path) -> sqlite3.Connection:
     if db_path.exists():
@@ -220,7 +311,7 @@ def init_db(db_path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode = OFF")
     conn.execute("PRAGMA synchronous = OFF")
     conn.execute("PRAGMA temp_store = MEMORY")
-    conn.execute("PRAGMA cache_size = -65536")  # 64 MB page cache
+    conn.execute("PRAGMA cache_size = -262144")   # 256 MB page cache
     return conn
 
 
@@ -230,447 +321,703 @@ def create_schema(conn: sqlite3.Connection) -> None:
             id TEXT PRIMARY KEY,
             parent_id TEXT,
             status TEXT,
-            scientific_name TEXT,
+            name TEXT,
             authorship TEXT,
             rank TEXT,
+            rank_idx INTEGER,
             extinct INTEGER,
             environment TEXT,
             link TEXT,
-            kingdom TEXT, phylum TEXT, class TEXT, "order" TEXT,
-            family TEXT, genus TEXT, species TEXT,
-            shard INTEGER
+            link_prefix TEXT,
+            kingdom TEXT,
+            merged INTEGER,
+            is_bin INTEGER,
+            shard INTEGER,
+            pshard INTEGER
         );
         CREATE TABLE vernacular (
-            taxon_id TEXT,
-            name TEXT,
-            language TEXT,
-            preferred INTEGER
+            taxon_id TEXT, name TEXT, language TEXT, preferred INTEGER,
+            prio INTEGER, shard INTEGER
         );
         CREATE TABLE distribution (
-            taxon_id TEXT,
-            area TEXT,
-            gazetteer TEXT,
-            establishment TEXT,
-            threat TEXT
+            taxon_id TEXT, area TEXT, area_id TEXT, gazetteer TEXT,
+            establishment TEXT, threat TEXT, shard INTEGER
         );
     """)
 
 
-def truthy(value: str) -> int:
-    return 1 if (value or "").strip().lower() in ("true", "1", "yes", "y") else 0
-
-
-def load_name_usage(conn: sqlite3.Connection, path: Path, limit: int | None) -> int:
+def load_name_usage(conn, path: Path, limit) -> int:
     cur = conn.cursor()
     cur.execute("BEGIN")
-    batch: list[tuple] = []
-    total = 0
+    batch, total = [], 0
     for row in iter_tsv(path, limit=limit):
-        record_id = row.get("ID", "").strip()
-        if not record_id:
+        rid = (row.get("ID") or "").strip()
+        if not rid:
             continue
+        pid = (row.get("parentID") or "").strip() or None
+        rank = (row.get("rank") or "").strip().lower() or "unranked"
+        name = (row.get("scientificName") or "").strip() or rid
+        status = (row.get("status") or "").strip().lower() or "accepted"
+        link = (row.get("link") or "").strip()
+        if not link.startswith(("http://", "https://")):
+            link = ""
         batch.append((
-            record_id,
-            (row.get("parentID") or "").strip() or None,
-            row.get("status") or None,
-            row.get("scientificName") or None,
-            row.get("authorship") or None,
-            row.get("rank") or None,
-            truthy(row.get("extinct", "")),
-            row.get("environment") or None,
-            row.get("link") or None,
-            row.get("kingdom") or None,
-            row.get("phylum") or None,
-            row.get("class") or None,
-            row.get("order") or None,
-            row.get("family") or None,
-            row.get("genus") or None,
-            row.get("species") or None,
-            shard_for(record_id),
+            rid, pid, status, name,
+            (row.get("authorship") or "").strip() or None,
+            rank, RANK_INDEX.get(rank, RANK_INDEX["other"]),
+            truthy(row.get("extinct")),
+            (row.get("environment") or "").strip() or None,
+            link or None,
+            link_prefix(link) if link else None,
+            (row.get("kingdom") or "").strip() or None,
+            truthy(row.get("merged")),
+            1 if is_bin(name) else 0,
+            shard_for(rid, CORE_SHARDS),
+            shard_for(pid, KIDS_SHARDS) if pid else None,
         ))
         if len(batch) >= INSERT_BATCH:
-            cur.executemany(
-                "INSERT OR IGNORE INTO taxa VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                batch,
-            )
+            cur.executemany("INSERT OR IGNORE INTO taxa VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", batch)
             total += len(batch)
             batch.clear()
-            if total % (INSERT_BATCH * 10) == 0:
-                log(f"  loaded {total:,} taxa…")
+            if total % (INSERT_BATCH * 20) == 0:
+                log(f"  loaded {total:,} name usages…")
     if batch:
-        cur.executemany(
-            "INSERT OR IGNORE INTO taxa VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            batch,
-        )
+        cur.executemany("INSERT OR IGNORE INTO taxa VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", batch)
+        total += len(batch)
+    conn.commit()
+    inserted = conn.execute("SELECT COUNT(*) FROM taxa").fetchone()[0]
+    if inserted != total:
+        log(f"  ! {total - inserted:,} duplicate IDs were ignored")
+    return inserted
+
+
+def vern_priority(language: str, preferred: int) -> int:
+    if language == "eng":
+        return 0 if preferred else 1
+    return 2 if preferred else 3
+
+
+def load_vernacular(conn, path: Path, limit) -> int:
+    cur = conn.cursor()
+    cur.execute("BEGIN")
+    batch, total = [], 0
+    for row in iter_tsv(path, limit=limit):
+        tid = (row.get("taxonID") or "").strip()
+        name = (row.get("name") or "").strip().strip('"').strip()   # some sources wrap names in quotes
+        if not tid or not name:
+            continue
+        lang = (row.get("language") or "").strip().lower() or None
+        pref = truthy(row.get("preferred"))
+        batch.append((tid, name, lang, pref, vern_priority(lang, pref),
+                      shard_for(tid, CORE_SHARDS)))
+        if len(batch) >= INSERT_BATCH:
+            cur.executemany("INSERT INTO vernacular VALUES (?,?,?,?,?,?)", batch)
+            total += len(batch)
+            batch.clear()
+    if batch:
+        cur.executemany("INSERT INTO vernacular VALUES (?,?,?,?,?,?)", batch)
         total += len(batch)
     conn.commit()
     return total
 
 
-def load_vernacular(conn: sqlite3.Connection, path: Path, limit: int | None) -> int:
+def load_distribution(conn, path: Path, limit) -> int:
     cur = conn.cursor()
     cur.execute("BEGIN")
-    batch: list[tuple] = []
-    total = 0
+    batch, total, skipped = [], 0, 0
     for row in iter_tsv(path, limit=limit):
-        taxon_id = (row.get("taxonID") or "").strip()
-        name = (row.get("name") or "").strip()
-        if not taxon_id or not name:
-            continue
-        batch.append((
-            taxon_id,
-            name,
-            (row.get("language") or "").strip() or None,
-            truthy(row.get("preferred", "")),
-        ))
-        if len(batch) >= INSERT_BATCH:
-            cur.executemany(
-                "INSERT INTO vernacular VALUES (?,?,?,?)", batch,
-            )
-            total += len(batch)
-            batch.clear()
-    if batch:
-        cur.executemany("INSERT INTO vernacular VALUES (?,?,?,?)", batch)
-        total += len(batch)
-    conn.commit()
-    return total
-
-
-def load_distribution(conn: sqlite3.Connection, path: Path, limit: int | None) -> int:
-    cur = conn.cursor()
-    cur.execute("BEGIN")
-    batch: list[tuple] = []
-    total = 0
-    for row in iter_tsv(path, limit=limit):
-        taxon_id = (row.get("taxonID") or "").strip()
+        tid = (row.get("taxonID") or "").strip()
         area = (row.get("area") or "").strip()
-        if not taxon_id or not area:
+        area_id = (row.get("areaID") or "").strip()
+        if not tid or not (area or area_id):
+            skipped += 1
             continue
         batch.append((
-            taxon_id,
-            area,
+            tid, area or None, area_id or None,
             (row.get("gazetteer") or "").strip() or None,
             (row.get("establishmentMeans") or "").strip() or None,
             (row.get("threatStatus") or "").strip() or None,
+            shard_for(tid, CORE_SHARDS),
         ))
         if len(batch) >= INSERT_BATCH:
-            cur.executemany(
-                "INSERT INTO distribution VALUES (?,?,?,?,?)", batch,
-            )
+            cur.executemany("INSERT INTO distribution VALUES (?,?,?,?,?,?,?)", batch)
             total += len(batch)
             batch.clear()
     if batch:
-        cur.executemany("INSERT INTO distribution VALUES (?,?,?,?,?)", batch)
+        cur.executemany("INSERT INTO distribution VALUES (?,?,?,?,?,?,?)", batch)
         total += len(batch)
     conn.commit()
+    if skipped:
+        log(f"  ! {skipped:,} distribution rows had neither area nor areaID")
     return total
 
 
 # ---------------------------------------------------------------------------
-# Phase 2 — index, then aggregate vernacular + distribution per taxon
+# Phase 2 — indexes and derived tables
 # ---------------------------------------------------------------------------
 
-
-def build_indexes(conn: sqlite3.Connection) -> None:
+def build_indexes(conn) -> None:
     conn.executescript("""
-        CREATE INDEX idx_taxa_shard ON taxa(shard);
-        CREATE INDEX idx_taxa_parent ON taxa(parent_id);
-        CREATE INDEX idx_taxa_rank ON taxa(rank);
-        CREATE INDEX idx_vern_taxon ON vernacular(taxon_id);
-        CREATE INDEX idx_dist_taxon ON distribution(taxon_id);
+        CREATE INDEX idx_taxa_shard   ON taxa(shard);
+        CREATE INDEX idx_taxa_pshard  ON taxa(pshard);
+        CREATE INDEX idx_taxa_parent  ON taxa(parent_id);
+        CREATE INDEX idx_vern_shard   ON vernacular(shard, taxon_id, prio);
+        CREATE INDEX idx_dist_shard   ON distribution(shard, taxon_id);
     """)
     conn.commit()
 
 
+def restrict_subtree(conn, root_ids: list[str]) -> None:
+    conn.executescript("CREATE TABLE keep (id TEXT PRIMARY KEY);")
+    for rid in root_ids:
+        conn.execute("""
+            WITH RECURSIVE sub(id) AS (
+                SELECT ?
+                UNION
+                SELECT t.id FROM taxa t JOIN sub ON t.parent_id = sub.id
+            )
+            INSERT OR IGNORE INTO keep SELECT id FROM sub""", (rid,))
+        conn.execute("""
+            WITH RECURSIVE up(id) AS (
+                SELECT parent_id FROM taxa WHERE id = ?
+                UNION
+                SELECT t.parent_id FROM taxa t JOIN up ON t.id = up.id WHERE t.parent_id IS NOT NULL
+            )
+            INSERT OR IGNORE INTO keep SELECT id FROM up WHERE id IS NOT NULL""", (rid,))
+    before = conn.execute("SELECT COUNT(*) FROM taxa").fetchone()[0]
+    conn.executescript("""
+        DELETE FROM taxa WHERE id NOT IN (SELECT id FROM keep);
+        DELETE FROM vernacular WHERE taxon_id NOT IN (SELECT id FROM keep);
+        DELETE FROM distribution WHERE taxon_id NOT IN (SELECT id FROM keep);
+        DROP TABLE keep;
+    """)
+    conn.commit()
+    after = conn.execute("SELECT COUNT(*) FROM taxa").fetchone()[0]
+    log(f"  kept {after:,} of {before:,} name usages")
+
+
+def build_counts(conn) -> None:
+    """Per-parent counts of accepted children and synonyms, per-taxon counts
+    of vernaculars and distribution rows.  One aggregate each — no N+1."""
+    conn.executescript(f"""
+        CREATE TABLE counts AS
+        SELECT parent_id AS id,
+               SUM(CASE WHEN status IN ('accepted','provisionally accepted') THEN 1 ELSE 0 END) AS nc,
+               SUM(CASE WHEN status NOT IN ('accepted','provisionally accepted') THEN 1 ELSE 0 END) AS ns,
+               SUM(CASE WHEN is_bin = 1 THEN 1 ELSE 0 END) AS nb
+        FROM taxa WHERE parent_id IS NOT NULL GROUP BY parent_id;
+        CREATE UNIQUE INDEX idx_counts ON counts(id);
+
+        CREATE TABLE vcounts AS
+        SELECT taxon_id AS id, COUNT(*) AS nv FROM vernacular GROUP BY taxon_id;
+        CREATE UNIQUE INDEX idx_vcounts ON vcounts(id);
+
+        CREATE TABLE dcounts AS
+        SELECT taxon_id AS id, COUNT(*) AS nd FROM distribution GROUP BY taxon_id;
+        CREATE UNIQUE INDEX idx_dcounts ON dcounts(id);
+    """)
+    # Mark "higher" nodes: accepted, above species rank, not a BIN, and —
+    # for unranked nodes — only if they actually have children.
+    conn.executescript(f"""
+        ALTER TABLE taxa ADD COLUMN higher INTEGER DEFAULT 0;
+        UPDATE taxa SET higher = 1
+        WHERE status IN ('accepted','provisionally accepted')
+          AND is_bin = 0
+          AND rank_idx < {SPECIES_INDEX}
+          AND (rank != 'unranked'
+               OR id IN (SELECT id FROM counts WHERE nc > 0));
+        CREATE INDEX idx_taxa_higher ON taxa(higher);
+    """)
+    conn.executescript(f"""
+        CREATE TABLE linkprefix AS
+        SELECT link_prefix AS prefix, COUNT(*) AS n FROM taxa
+        WHERE link_prefix IS NOT NULL GROUP BY link_prefix HAVING COUNT(*) >= {LINK_PREFIX_MIN};
+    """)
+    conn.commit()
+
+
+def link_dictionary(conn) -> list[str]:
+    return [row[0] for row in conn.execute("SELECT prefix FROM linkprefix ORDER BY n DESC, prefix")]
+
+
 # ---------------------------------------------------------------------------
-# Phase 3 — emit sharded taxon JSON files
+# Phase 3 — higher taxa with inline ancestor chains
 # ---------------------------------------------------------------------------
 
+def emit_higher(conn, out_dir: Path) -> tuple[list, int]:
+    """Returns (roots, orphan_count).  A root is a higher node whose parent is
+    missing or unresolvable.  Chains are built from an in-memory map of the
+    higher nodes only (hundreds of thousands, not millions)."""
+    nodes: dict[str, tuple] = {}
+    for rid, pid, name, rank in conn.execute(
+            "SELECT id, parent_id, name, rank FROM taxa WHERE higher = 1"):
+        nodes[rid] = (pid, name, rank)
+    log(f"  {len(nodes):,} higher taxa")
 
-def fetch_vernaculars(conn: sqlite3.Connection, taxon_id: str) -> list[dict]:
-    cur = conn.execute(
-        """SELECT name, language, preferred FROM vernacular
-           WHERE taxon_id = ? ORDER BY preferred DESC, language ASC LIMIT ?""",
-        (taxon_id, MAX_VERNACULARS_PER_TAXON),
-    )
-    return [{"n": n, "l": l or "", "p": bool(p)} for n, l, p in cur]
+    chain_cache: dict[str, list] = {}
+
+    def chain_of(rid: str) -> list:
+        """Ancestor chain [[id, name, rank], …] root → parent of rid."""
+        if rid in chain_cache:
+            return chain_cache[rid]
+        path, cur, seen = [], rid, set()
+        while True:
+            pid = nodes[cur][0]
+            if not pid or pid not in nodes or pid in seen:
+                break
+            seen.add(pid)
+            if pid in chain_cache:
+                path = chain_cache[pid] + [[pid, nodes[pid][1], rank_code(nodes[pid][2])]] + path
+                break
+            path.insert(0, [pid, nodes[pid][1], rank_code(nodes[pid][2])])
+            cur = pid
+        chain_cache[rid] = path
+        return path
+
+    roots, orphans = [], 0
+    buckets: list[dict] = [dict() for _ in range(HIGHER_SHARDS)]
+    counts = {rid: (nc, ns) for rid, nc, ns in conn.execute("SELECT id, nc, ns FROM counts")}
+    for rid, (pid, name, rank) in nodes.items():
+        chain = chain_of(rid)
+        rec = {"i": rid, "n": name, "r": rank_code(rank), "A": chain}
+        nc, ns = counts.get(rid, (0, 0))
+        if nc:
+            rec["nc"] = nc
+        if ns:
+            rec["ns"] = ns
+        if not pid:
+            roots.append({"i": rid, "n": name, "r": rank_code(rank), "nc": nc})
+        elif pid not in nodes:
+            orphans += 1
+            rec["orphan"] = 1
+        buckets[shard_for(rid, HIGHER_SHARDS)][rid] = rec
+    for i, bucket in enumerate(buckets):
+        write_json(out_dir / f"{i}.json", bucket)
+    roots.sort(key=lambda r: (r["r"] != RANK_INDEX["domain"], r["n"]))
+    log(f"  roots: {[r['n'] for r in roots]}; orphan higher nodes: {orphans:,}")
+    return roots, orphans
 
 
-def fetch_distribution(conn: sqlite3.Connection, taxon_id: str) -> list[dict]:
-    cur = conn.execute(
-        """SELECT area, gazetteer, establishment, threat FROM distribution
-           WHERE taxon_id = ? LIMIT ?""",
-        (taxon_id, MAX_DISTRIBUTION_PER_TAXON),
-    )
-    return [
-        {"a": a, "g": g or "", "e": e or "", "t": t or ""}
-        for a, g, e, t in cur
-    ]
+# ---------------------------------------------------------------------------
+# Phase 4 — core records, details, children pages
+# ---------------------------------------------------------------------------
 
-
-def fetch_children_ids(conn: sqlite3.Connection, parent_id: str) -> list[str]:
-    cur = conn.execute(
-        "SELECT id FROM taxa WHERE parent_id = ? ORDER BY scientific_name",
-        (parent_id,),
-    )
-    return [row[0] for row in cur]
-
-
-def emit_taxa_shards(conn: sqlite3.Connection, out_dir: Path) -> None:
-    """For each shard, write data/taxa/<shard>.json containing every taxon
-    whose ID hashes into that shard.
-
-    Per-record schema (compact keys to keep size down — gzip helps further):
-        i  ID
-        p  parent ID
-        n  scientific name
-        a  authorship
-        r  rank
-        s  status
-        x  extinct (bool)
-        e  environment
-        l  link
-        L  lineage dict (k, ph, cl, or, fa, ge, sp)
-        v  vernacular [{n,l,p}]
-        d  distribution [{a,g,e,t}]
-        c  children IDs (kept in detail too — small lists fold in cleanly)
+def emit_core(conn, out_dir: Path, link_dict: list[str]) -> None:
+    """taxa/<shard>.json — compact keys:
+        i id   n name   a authorship   r rank code (meta.ranks)   s status code
+        (meta.statuses; omitted when accepted)
+        p parent id   x extinct   e environment   l external link
+        h 1 if this record has an entry in higher/   b 1 if BOLD BIN
+        m 1 if added by the eXtended Release merge
+        nc accepted children   ns synonyms   nv vernaculars   nd distributions
+        l  is either a full URL or [prefixIndex, suffix] (see meta.linkPrefixes)
     """
-    out_dir.mkdir(parents=True, exist_ok=True)
-    cur = conn.cursor()
-    total = conn.execute("SELECT COUNT(*) FROM taxa").fetchone()[0]
-    log(f"  emitting {total:,} taxa across {NUM_SHARDS} shards…")
-    for shard in range(NUM_SHARDS):
-        cur.execute(
-            """SELECT id, parent_id, status, scientific_name, authorship,
-                      rank, extinct, environment, link,
-                      kingdom, phylum, class, "order", family, genus, species
-               FROM taxa WHERE shard = ? ORDER BY id""",
-            (shard,),
-        )
-        bucket: dict[str, dict] = {}
-        for (rid, pid, status, name, author, rank, extinct, env, link,
-             k, ph, cl, ord_, fa, ge, sp) in cur.fetchall():
-            lineage = {}
-            if k:  lineage["k"]  = k
-            if ph: lineage["ph"] = ph
-            if cl: lineage["cl"] = cl
-            if ord_: lineage["or"] = ord_
-            if fa: lineage["fa"] = fa
-            if ge: lineage["ge"] = ge
-            if sp: lineage["sp"] = sp
-            record: dict = {
-                "i": rid,
-                "n": name or rid,
-            }
-            if pid:    record["p"] = pid
-            if author: record["a"] = author
-            if rank:   record["r"] = rank
-            if status: record["s"] = status
-            if extinct: record["x"] = 1
-            if env:    record["e"] = env
-            if link:   record["l"] = link
-            if lineage: record["L"] = lineage
-            verns = fetch_vernaculars(conn, rid)
-            if verns: record["v"] = verns
-            dist = fetch_distribution(conn, rid)
-            if dist: record["d"] = dist
-            kids = fetch_children_ids(conn, rid)
-            if kids: record["c"] = kids
-            bucket[rid] = record
+    prefix_idx = {pfx: i for i, pfx in enumerate(link_dict)}
+    total = 0
+    for shard in range(CORE_SHARDS):
+        bucket = {}
+        for (rid, pid, status, name, author, rank, extinct, env, link, merged,
+             bin_, higher, nc, ns, nv, nd) in conn.execute(
+                """SELECT t.id, t.parent_id, t.status, t.name, t.authorship, t.rank,
+                          t.extinct, t.environment, t.link, t.merged, t.is_bin, t.higher,
+                          c.nc, c.ns, v.nv, d.nd
+                   FROM taxa t
+                   LEFT JOIN counts  c ON c.id = t.id
+                   LEFT JOIN vcounts v ON v.id = t.id
+                   LEFT JOIN dcounts d ON d.id = t.id
+                   WHERE t.shard = ? ORDER BY t.id""", (shard,)):
+            rec = {"i": rid, "n": name}
+            if author: rec["a"] = author
+            if rank and rank != "unranked": rec["r"] = rank_code(rank)
+            if status != "accepted": rec["s"] = status_code(status)
+            if pid: rec["p"] = pid
+            if extinct: rec["x"] = 1
+            if env: rec["e"] = env
+            if link:
+                pfx = link_prefix(link)
+                rec["l"] = [prefix_idx[pfx], link[len(pfx):]] if pfx in prefix_idx else link
+            if merged: rec["m"] = 1
+            if bin_: rec["b"] = 1
+            if higher: rec["h"] = 1
+            if nc: rec["nc"] = nc
+            if ns: rec["ns"] = ns
+            if nv: rec["nv"] = nv
+            if nd: rec["nd"] = nd
+            bucket[rid] = rec
         write_json(out_dir / f"{shard}.json", bucket)
-        if shard % 64 == 0:
-            log(f"    shard {shard}/{NUM_SHARDS} ({len(bucket)} records)")
+        total += len(bucket)
+        if shard % 512 == 0:
+            log(f"    core shard {shard}/{CORE_SHARDS} ({len(bucket)} records)")
+    log(f"  {total:,} core records written")
+
+
+def emit_detail(conn, out_dir: Path) -> None:
+    """detail/<shard>.json — {id: {v: [[name, lang, preferred]…],
+                                   d: [[area, areaId, gazetteer, establishment, threat]…]}}"""
+    for shard in range(CORE_SHARDS):
+        bucket: dict[str, dict] = {}
+        last, n = None, 0
+        for tid, name, lang, pref in conn.execute(
+                """SELECT taxon_id, name, language, preferred FROM vernacular
+                   WHERE shard = ? ORDER BY taxon_id, prio, language, name""", (shard,)):
+            if tid != last:
+                last, n = tid, 0
+            n += 1
+            if n > MAX_VERNACULARS:
+                continue
+            bucket.setdefault(tid, {}).setdefault("v", []).append([name, lang or "", 1 if pref else 0])
+        last, n = None, 0
+        for tid, area, area_id, gaz, est, threat in conn.execute(
+                """SELECT taxon_id, area, area_id, gazetteer, establishment, threat
+                   FROM distribution WHERE shard = ? ORDER BY taxon_id, gazetteer, COALESCE(area, area_id)""", (shard,)):
+            if tid != last:
+                last, n = tid, 0
+            n += 1
+            if n > MAX_DISTRIBUTION:
+                continue
+            bucket.setdefault(tid, {}).setdefault("d", []).append(
+                [area or "", area_id or "", gaz or "", est or "", threat or ""])
+        write_json(out_dir / f"{shard}.json", bucket)
+        if shard % 512 == 0:
+            log(f"    detail shard {shard}/{CORE_SHARDS}")
+
+
+def child_summary(row) -> list:
+    """[id, name, rankCode, statusCode, extinct, nc, flags]  (flags bit0 = BIN)"""
+    rid, name, rank, status, extinct, bin_, nc = row
+    return [rid, name, rank_code(rank), status_code(status), 1 if extinct else 0,
+            nc or 0, 1 if bin_ else 0]
+
+
+def emit_kids(conn, out_dir: Path) -> int:
+    """kids/<shard>.json — {parentId: {c: [...first page...], s: [...]}}
+    plus overflow pages kids/p/<parentId>-c<n>.json / -s<n>.json."""
+    pages_dir = out_dir / "p"
+    overflow_pages = 0
+    for shard in range(KIDS_SHARDS):
+        bucket: dict[str, dict] = {}
+        cur_parent, acc, syn = None, [], []
+
+        def flush():
+            nonlocal overflow_pages
+            if cur_parent is None:
+                return
+            entry = {}
+            for key, items in (("c", acc), ("s", syn)):
+                if not items:
+                    continue
+                entry[key] = items[:KIDS_PAGE]
+                for page_no, start in enumerate(range(KIDS_PAGE, len(items), KIDS_PAGE), start=1):
+                    write_json(pages_dir / f"{cur_parent}-{key}{page_no}.json",
+                               items[start:start + KIDS_PAGE])
+                    overflow_pages += 1
+            bucket[cur_parent] = entry
+
+        for row in conn.execute(
+                """SELECT t.parent_id, t.id, t.name, t.rank, t.status, t.extinct, t.is_bin, c.nc
+                   FROM taxa t LEFT JOIN counts c ON c.id = t.id
+                   WHERE t.pshard = ?
+                   ORDER BY t.parent_id,
+                            CASE WHEN t.status IN ('accepted','provisionally accepted') THEN 0 ELSE 1 END,
+                            t.is_bin, t.rank_idx, t.name""", (shard,)):
+            pid = row[0]
+            if pid != cur_parent:
+                flush()
+                cur_parent, acc, syn = pid, [], []
+            summary = child_summary(row[1:])
+            (acc if row[4] in ACCEPTED_STATUSES else syn).append(summary)
+        flush()
+        write_json(out_dir / f"{shard}.json", bucket)
+        if shard % 256 == 0:
+            log(f"    kids shard {shard}/{KIDS_SHARDS} ({len(bucket)} parents)")
+    log(f"  {overflow_pages:,} overflow child pages written")
+    return overflow_pages
 
 
 # ---------------------------------------------------------------------------
-# Phase 4 — search index, sharded by 2-char prefix
+# Phase 5 — search index (adaptive prefix trie, built inside SQLite)
 # ---------------------------------------------------------------------------
 
+def build_search_table(conn, include_bins: bool) -> int:
+    conn.executescript("""
+        CREATE TABLE search (
+            key TEXT, id TEXT, name TEXT, rank, kind INTEGER, prio INTEGER, extra TEXT
+        );
+    """)
+    cur = conn.cursor()
+    cur.execute("BEGIN")
+    batch, total = [], 0
 
-def emit_search_index(conn: sqlite3.Connection, out_dir: Path) -> dict:
-    """Sharded autocomplete index. Every entry contains:
-        i  ID                  (so the frontend can navigate)
-        n  display name        (scientific or vernacular)
-        r  rank (optional)
-        v  is vernacular (1) vs scientific (0)
-    The shards are tiny JSON objects keyed by prefix (e.g. ``ho.json`` for all
-    names starting with "ho"), kept under ~1MB each."""
-    out_dir.mkdir(parents=True, exist_ok=True)
-    buckets: dict[str, list[dict]] = {}
-
-    def add(name: str, rid: str, rank: str | None, is_vern: bool) -> None:
-        norm = normalise_search(name)
-        if not norm:
+    def add(key, rid, name, rank, kind, rank_weight, extra=None):
+        nonlocal total
+        if not key:
             return
-        prefix = search_prefix(norm)
-        entry: dict = {"i": rid, "n": name}
-        if rank:
-            entry["r"] = rank
-        if is_vern:
-            entry["v"] = 1
-        buckets.setdefault(prefix, []).append(entry)
+        prio = kind * 10 + rank_weight
+        batch.append((key, rid, name, rank, kind, prio, extra))
+        if len(batch) >= INSERT_BATCH:
+            cur.executemany("INSERT INTO search VALUES (?,?,?,?,?,?,?)", batch)
+            total += len(batch)
+            batch.clear()
 
     log("  indexing scientific names…")
-    for rid, name, rank in conn.execute(
-            "SELECT id, scientific_name, rank FROM taxa WHERE scientific_name IS NOT NULL"):
-        add(name, rid, rank, is_vern=False)
+    bin_filter = "" if include_bins else " AND is_bin = 0"
+    for rid, name, rank, status, rank_idx in conn.execute(
+            f"SELECT id, name, rank, status, rank_idx FROM taxa WHERE name IS NOT NULL{bin_filter}"):
+        key = normalise(name)
+        if status == "accepted":
+            kind = KIND_SCI_ACCEPTED
+        elif status == "provisionally accepted":
+            kind = KIND_SCI_PROVISIONAL
+        else:
+            kind = KIND_SCI_SYNONYM
+        rw = RANK_WEIGHT.get(rank, 3)
+        add(key, rid, name, rank_code(rank), kind, rw)
+        # Epithet tokens for accepted species/genera-level names so that
+        # "tigris" finds Panthera tigris.
+        if kind == KIND_SCI_ACCEPTED and rank == "species":
+            words = key.split(" ")
+            for w in words[1:]:
+                if len(w) >= SEARCH_MIN_TOKEN and w != words[0]:
+                    add(w, rid, name, rank_code(rank), KIND_TOKEN, rw, w)
 
     log("  indexing vernacular names…")
-    for tid, name in conn.execute(
-            "SELECT taxon_id, name FROM vernacular"):
-        add(name, tid, None, is_vern=True)
+    for tid, name, lang, sci in conn.execute(
+            """SELECT v.taxon_id, v.name, v.language, t.name FROM vernacular v
+               JOIN taxa t ON t.id = v.taxon_id ORDER BY v.taxon_id, v.prio"""):
+        key = normalise(name)
+        rw = 0 if lang == "eng" else 1
+        add(key, tid, name, lang or "", KIND_VERNACULAR, rw, sci)
+        if lang == "eng":
+            words = key.split(" ")
+            for w in words[1:]:
+                if len(w) >= SEARCH_MIN_TOKEN:
+                    add(w, tid, name, lang, KIND_TOKEN, rw + 1, sci)
+    if batch:
+        cur.executemany("INSERT INTO search VALUES (?,?,?,?,?,?,?)", batch)
+        total += len(batch)
+    conn.commit()
+    log(f"  {total:,} search entries; indexing…")
+    conn.execute("CREATE INDEX idx_search_key ON search(key, prio, length(name))")
+    conn.commit()
+    return total
 
-    log(f"  writing {len(buckets)} search shards…")
-    for prefix, entries in buckets.items():
-        # cap each shard at 5000 entries to keep them quick to download;
-        # the frontend will live-filter what's returned.
-        entries.sort(key=lambda e: (len(e["n"]), e["n"]))
-        if len(entries) > 5000:
-            entries = entries[:5000]
-        write_json(out_dir / f"{prefix}.json", entries)
 
-    manifest = {
-        "shards": sorted(buckets.keys()),
-        "totalEntries": sum(len(v) for v in buckets.values()),
-    }
-    write_json(out_dir / "manifest.json", manifest)
-    return manifest
+def emit_search(conn, out_dir: Path) -> dict:
+    """Adaptive prefix sharding.  Walk prefixes of increasing length; a prefix
+    whose entry count fits in SEARCH_SHARD_LIMIT gets a full shard, otherwise
+    a summary shard (top entries by priority) and its children are visited.
+    manifest.json maps each emitted prefix to 'f' (full) or 's' (summary)."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    manifest: dict[str, str] = {}
+    stats = {"full": 0, "summary": 0, "entries": 0}
+
+    def count(prefix: str) -> int:
+        return conn.execute(
+            "SELECT COUNT(*) FROM search WHERE key >= ? AND key < ?",
+            (prefix, prefix + "\uffff")).fetchone()[0]
+
+    def rows(prefix: str, limit: int | None):
+        order = " ORDER BY prio, length(name), name"
+        if limit is None:
+            return conn.execute(
+                "SELECT id, name, rank, kind, key, extra FROM search WHERE key >= ? AND key < ?" + order,
+                (prefix, prefix + "\uffff"))
+        # Summary: every exact-key entry (they have no longer prefix to live
+        # under) followed by the top entries of the whole range.
+        exact = conn.execute(
+            "SELECT id, name, rank, kind, key, extra FROM search WHERE key = ?" + order, (prefix,)).fetchall()
+        top = conn.execute(
+            "SELECT id, name, rank, kind, key, extra FROM search WHERE key > ? AND key < ?" + order
+            + f" LIMIT {int(limit)}", (prefix, prefix + "\uffff")).fetchall()
+        return exact + top
+
+    def entry(row) -> list:
+        """[id, display, rankCode|language, kind, extra] — extra is the matched
+        word for epithet tokens and the scientific name for vernacular hits."""
+        rid, name, rank, kind, key, extra = row
+        e = [rid, name, rank, kind]
+        if extra:
+            e.append(extra)
+        return e
+
+    def visit(prefix: str):
+        n = count(prefix)
+        if n == 0:
+            return
+        if n <= SEARCH_SHARD_LIMIT or len(prefix) >= SEARCH_MAX_PREFIX:
+            write_json(out_dir / f"{prefix_filename(prefix)}.json",
+                       [entry(r) for r in rows(prefix, None)])
+            manifest[prefix] = "f"
+            stats["full"] += 1
+            stats["entries"] += n
+            return
+        write_json(out_dir / f"{prefix_filename(prefix)}.json",
+                   [entry(r) for r in rows(prefix, SEARCH_SUMMARY_LIMIT)])
+        manifest[prefix] = "s"
+        stats["summary"] += 1
+        nxt = conn.execute(
+            "SELECT DISTINCT substr(key, ?, 1) FROM search WHERE key >= ? AND key < ?",
+            (len(prefix) + 1, prefix, prefix + "\uffff")).fetchall()
+        for (ch,) in nxt:
+            if ch:
+                visit(prefix + ch)
+
+    first = conn.execute("SELECT DISTINCT substr(key, 1, 1) FROM search").fetchall()
+    for (ch,) in sorted(first):
+        if ch:
+            visit(ch)
+    manifest_doc = {"maxPrefix": SEARCH_MAX_PREFIX, "shards": manifest}
+    write_json(out_dir / "manifest.json", manifest_doc)
+    log(f"  search shards: {stats['full']:,} full, {stats['summary']:,} summary; "
+        f"{stats['entries']:,} entries in full shards")
+    return manifest_doc
 
 
 # ---------------------------------------------------------------------------
-# Phase 5 — manifest, stats, and a "roots" listing for the home page
+# Phase 6 — meta.json
 # ---------------------------------------------------------------------------
 
-
-def emit_roots(conn: sqlite3.Connection, out_dir: Path) -> list[dict]:
-    """Records with no parent (or parent that doesn't resolve) are roots —
-    typically the kingdoms. We pre-compute the listing so the home page is
-    instant."""
-    cur = conn.execute("""
-        SELECT t.id, t.scientific_name, t.rank
-        FROM taxa t
-        LEFT JOIN taxa p ON p.id = t.parent_id
-        WHERE t.parent_id IS NULL OR p.id IS NULL
-        ORDER BY t.scientific_name
-    """)
-    roots = [{"i": rid, "n": name, "r": rank}
-             for rid, name, rank in cur.fetchall()]
-    write_json(out_dir / "roots.json", roots)
-    return roots
-
-
-def emit_stats(conn: sqlite3.Connection, out_dir: Path, roots: list[dict]) -> dict:
+def emit_meta(conn, out_dir: Path, roots: list, orphans: int, metadata: dict,
+              include_bins: bool, link_dict: list[str]) -> dict:
+    q = lambda sql, *a: conn.execute(sql, a).fetchone()[0]
+    status_counts = dict(conn.execute("SELECT status, COUNT(*) FROM taxa GROUP BY status"))
     rank_counts = dict(conn.execute(
-        "SELECT rank, COUNT(*) FROM taxa GROUP BY rank"
-    ).fetchall())
-    status_counts = dict(conn.execute(
-        "SELECT status, COUNT(*) FROM taxa GROUP BY status"
-    ).fetchall())
-    extinct_count = conn.execute(
-        "SELECT COUNT(*) FROM taxa WHERE extinct = 1"
-    ).fetchone()[0]
-    total = conn.execute("SELECT COUNT(*) FROM taxa").fetchone()[0]
-    vern_total = conn.execute("SELECT COUNT(*) FROM vernacular").fetchone()[0]
-    dist_total = conn.execute("SELECT COUNT(*) FROM distribution").fetchone()[0]
-
-    # Per-kingdom breakdown so the home page can show actual biodiversity
-    # distribution (Animalia vs Plantae vs Fungi etc.) instead of a flat
-    # rank-count table that doesn't answer any interesting question.
-    kingdom_counts: dict[str, dict[str, int]] = {}
-    for kingdom, rank, count in conn.execute(
-        """SELECT kingdom, COALESCE(rank, 'unranked'), COUNT(*)
-           FROM taxa
-           WHERE kingdom IS NOT NULL AND kingdom != ''
-           GROUP BY kingdom, rank"""
-    ):
-        kingdom_counts.setdefault(kingdom, {})[rank] = count
-    # Tag taxa without any kingdom field separately (mostly viruses and
-    # incertae sedis records) so the chart can show them honestly.
-    no_kingdom = conn.execute(
-        "SELECT COUNT(*) FROM taxa WHERE kingdom IS NULL OR kingdom = ''"
-    ).fetchone()[0]
-    if no_kingdom:
-        kingdom_counts["(no kingdom assigned)"] = {"unranked": no_kingdom}
-
-    stats = {
-        "totalTaxa": total,
-        "totalVernaculars": vern_total,
-        "totalDistributionEntries": dist_total,
-        "extinctCount": extinct_count,
-        "rootCount": len(roots),
-        "rankCounts": rank_counts,
-        "statusCounts": status_counts,
-        "kingdomCounts": kingdom_counts,
-        "rankOrder": RANK_ORDER,
-        "numShards": NUM_SHARDS,
+        "SELECT rank, COUNT(*) FROM taxa WHERE status IN ('accepted','provisionally accepted') GROUP BY rank"))
+    accepted_species = q(
+        "SELECT COUNT(*) FROM taxa WHERE rank='species' AND status IN ('accepted','provisionally accepted') AND is_bin=0")
+    kingdom_counts = {}
+    for kingdom, rank, n in conn.execute(
+            """SELECT COALESCE(kingdom,''), rank, COUNT(*) FROM taxa
+               WHERE status IN ('accepted','provisionally accepted') AND is_bin = 0
+                 AND rank IN ('species','genus','family')
+               GROUP BY kingdom, rank"""):
+        kingdom_counts.setdefault(kingdom or "(no kingdom)", {})[rank] = n
+    languages = [{"l": l or "", "n": n} for l, n in conn.execute(
+        "SELECT language, COUNT(*) FROM vernacular GROUP BY language ORDER BY COUNT(*) DESC LIMIT 25")]
+    meta = {
+        "schema": SCHEMA_VERSION,
         "generatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "dataset": metadata,
+        "ranks": RANK_ORDER,
+        "statuses": STATUS_ORDER,
+        "shards": {"core": CORE_SHARDS, "higher": HIGHER_SHARDS, "kids": KIDS_SHARDS,
+                   "kidsPage": KIDS_PAGE, "searchMaxPrefix": SEARCH_MAX_PREFIX},
+        "counts": {
+            "nameUsages": q("SELECT COUNT(*) FROM taxa"),
+            "accepted": status_counts.get("accepted", 0) + status_counts.get("provisionally accepted", 0),
+            "acceptedSpecies": accepted_species,
+            "synonyms": sum(v for k, v in status_counts.items() if k not in ACCEPTED_STATUSES),
+            "bins": q("SELECT COUNT(*) FROM taxa WHERE is_bin = 1"),
+            "extinct": q("SELECT COUNT(*) FROM taxa WHERE extinct = 1 AND status IN ('accepted','provisionally accepted')"),
+            "xrAdded": q("SELECT COUNT(*) FROM taxa WHERE merged = 1"),
+            "vernaculars": q("SELECT COUNT(*) FROM vernacular"),
+            "taxaWithVernaculars": q("SELECT COUNT(*) FROM vcounts"),
+            "distributions": q("SELECT COUNT(*) FROM distribution"),
+            "taxaWithDistributions": q("SELECT COUNT(*) FROM dcounts"),
+            "higherTaxa": q("SELECT COUNT(*) FROM taxa WHERE higher = 1"),
+            "orphanHigherTaxa": orphans,
+            "byStatus": status_counts,
+            "byRank": rank_counts,
+            "byKingdom": kingdom_counts,
+            "vernacularLanguages": languages,
+        },
+        "search": {"includesBins": include_bins},
+        "kidsFields": ["id", "name", "rank", "status", "extinct", "nc", "flags"],
+        "searchFields": ["id", "name", "rankOrLang", "kind", "extra (matched word | scientific name)"],
+        "searchKinds": ["accepted", "vernacular", "provisional", "synonym", "token"],
+        "linkPrefixes": link_dict,
+        "roots": roots,
     }
-    write_json(out_dir / "stats.json", stats)
-    return stats
+    write_json(out_dir / "meta.json", meta)
+    return meta
 
 
 # ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
 
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--input", required=True, help="Folder with the ColDP .tsv files")
+    parser.add_argument("--output", required=True, help="Folder to write the static data into")
+    parser.add_argument("--limit", type=int, default=None, help="Cap rows per TSV (smoke tests)")
+    parser.add_argument("--keep-db", action="store_true", help="Keep the scratch SQLite database")
+    parser.add_argument("--include-bins", action="store_true",
+                        help="Index BOLD barcode clusters (BOLD:…) in search as well")
+    parser.add_argument("--exclude-bins", action="store_true",
+                        help="Drop BOLD barcode clusters from the output entirely (smaller site)")
+    parser.add_argument("--subtree", default=None,
+                        help="Comma-separated taxon IDs: keep only these, their descendants "
+                             "and their ancestors (realistic local dev subset)")
+    args = parser.parse_args(argv)
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", required=True,
-                        help="Folder containing the raw .tsv files.")
-    parser.add_argument("--output", required=True,
-                        help="Folder to write the static JSON tree into.")
-    parser.add_argument("--limit", type=int, default=None,
-                        help="Optional: cap rows per TSV (handy for smoke tests).")
-    parser.add_argument("--keep-db", action="store_true",
-                        help="Don't delete the scratch SQLite DB on exit.")
-    args = parser.parse_args()
-
-    in_dir = Path(args.input)
-    out_dir = Path(args.output)
+    in_dir, out_dir = Path(args.input), Path(args.output)
+    if out_dir.exists():
+        # Only ever clear a folder we previously generated.
+        marker = out_dir / "meta.json"
+        if any(out_dir.iterdir()) and not marker.exists():
+            log(f"! refusing to write into non-empty folder without meta.json: {out_dir}")
+            return 2
+        for child in out_dir.iterdir():
+            shutil.rmtree(child) if child.is_dir() else child.unlink()
     out_dir.mkdir(parents=True, exist_ok=True)
-    db_path = out_dir / "_scratch.sqlite"
+    db_path = out_dir.parent / f"_scratch_{out_dir.name}.sqlite"
 
-    log("Catalogue of Life — static processor starting")
+    log("Catalogue of Life — static processor v2")
     log(f"  input : {in_dir}")
     log(f"  output: {out_dir}")
     if args.limit:
-        log(f"  LIMIT mode: only first {args.limit:,} rows per file")
+        log(f"  LIMIT mode: first {args.limit:,} rows per file")
 
     conn = init_db(db_path)
     try:
-        with step("create schema"):
+        with step("schema"):
             create_schema(conn)
-        with step("reassemble NameUsage.tsv (if uploaded as split parts)"):
-            name_usage_path = reassemble_split(in_dir, "NameUsage")
-            if name_usage_path is None:
-                log("  ! NameUsage.tsv (or NameUsage_part_*) not found.")
-                name_usage_path = in_dir / "NameUsage.tsv"  # let load_name_usage warn
+        with step("read metadata.yaml"):
+            metadata = read_metadata(in_dir)
+            log(f"  {metadata}")
+        with step("locate NameUsage.tsv"):
+            nu = name_usage_sources(in_dir)
         with step("load NameUsage.tsv"):
-            n = load_name_usage(conn, name_usage_path, args.limit)
-            log(f"  taxa loaded: {n:,}")
+            log(f"  {load_name_usage(conn, nu, args.limit):,} name usages")
         with step("load VernacularName.tsv"):
-            n = load_vernacular(conn, in_dir / "VernacularName.tsv", args.limit)
-            log(f"  vernacular rows: {n:,}")
+            log(f"  {load_vernacular(conn, in_dir / 'VernacularName.tsv', args.limit):,} vernacular rows")
         with step("load Distribution.tsv"):
-            n = load_distribution(conn, in_dir / "Distribution.tsv", args.limit)
-            log(f"  distribution rows: {n:,}")
-        with step("build indexes"):
+            log(f"  {load_distribution(conn, in_dir / 'Distribution.tsv', args.limit):,} distribution rows")
+        if args.exclude_bins:
+            with step("drop BOLD BINs"):
+                conn.execute("DELETE FROM taxa WHERE is_bin = 1")
+                conn.commit()
+        with step("indexes"):
             build_indexes(conn)
-        with step("emit taxa shards"):
-            emit_taxa_shards(conn, out_dir / "taxa")
-        with step("emit search index"):
-            emit_search_index(conn, out_dir / "search")
-        with step("emit roots + stats"):
-            roots = emit_roots(conn, out_dir)
-            stats = emit_stats(conn, out_dir, roots)
-            log(f"  total taxa: {stats['totalTaxa']:,}")
-            log(f"  roots: {stats['rootCount']}")
+        if args.subtree:
+            with step(f"restrict to subtree(s) {args.subtree}"):
+                restrict_subtree(conn, [t.strip() for t in args.subtree.split(",") if t.strip()])
+        with step("derived counts + higher-taxa flags"):
+            build_counts(conn)
+        with step("emit higher/"):
+            roots, orphans = emit_higher(conn, out_dir / "higher")
+        with step("emit taxa/"):
+            link_dict = link_dictionary(conn)
+            log(f"  {len(link_dict)} shared link prefixes")
+            emit_core(conn, out_dir / "taxa", link_dict)
+        with step("emit detail/"):
+            emit_detail(conn, out_dir / "detail")
+        with step("emit kids/"):
+            emit_kids(conn, out_dir / "kids")
+        with step("build search table"):
+            build_search_table(conn, args.include_bins)
+        with step("emit search/"):
+            emit_search(conn, out_dir / "search")
+        with step("emit meta.json"):
+            meta = emit_meta(conn, out_dir, roots, orphans, metadata, args.include_bins, link_dict)
+            log(f"  name usages: {meta['counts']['nameUsages']:,}; "
+                f"accepted species: {meta['counts']['acceptedSpecies']:,}")
     finally:
         conn.close()
         if not args.keep_db and db_path.exists():
             db_path.unlink()
-
     log("Done.")
     return 0
 

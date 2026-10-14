@@ -1,111 +1,104 @@
-# Catalogue of Life — Static Explorer
+# Catalogue of Life Explorer — how it works
 
-A fast, fully-static React site that lets anyone browse and search the
-[Catalogue of Life](https://www.catalogueoflife.org/) — every named species
-on Earth — straight from a free GitHub Pages deployment.
-
-> **🧭 New here?** Read [`GUIDE.md`](./GUIDE.md). It's a click-by-click
-> walk-through that needs zero command-line knowledge.
-
----
+A static React site for the Catalogue of Life. Data processing happens once,
+in a GitHub Action; the published site is plain files on GitHub Pages.
 
 ## Architecture
 
 ```
-   ┌──────────────────────┐    upload via browser
-   │  Catalogue of Life   │  ─────────────────────────►  GitHub Release "data-v1"
-   │  raw .tsv dump       │                              (NameUsage.tsv,
-   └──────────────────────┘                               VernacularName.tsv,
-                                                          Distribution.tsv)
-                                                                │
-                                                                ▼
-                                          ┌────────────────────────────────────┐
-                                          │  GitHub Actions (build.yml)        │
-                                          │   1. gh release download            │
-                                          │   2. python scripts/process_data.py │
-                                          │      streams TSV → SQLite → JSON    │
-                                          │   3. Vite build (React frontend)    │
-                                          │   4. actions/deploy-pages           │
-                                          └────────────────────────────────────┘
-                                                                │
-                                                                ▼
-                                                  ┌────────────────────────────┐
-                                                  │  https://you.github.io/…/  │
-                                                  │   ➜ HTML + JS + 1024 shards │
-                                                  │   ➜ search index by prefix  │
-                                                  └────────────────────────────┘
+Catalogue of Life ColDP download        (NameUsage, VernacularName, Distribution, metadata.yaml)
+        │  upload to a GitHub Release (tag e.g. data-v1)
+        ▼
+GitHub Action  .github/workflows/deploy.yml
+   1. gh release download
+   2. python scripts/process_data.py      TSV → SQLite scratch → ~50 000 JSON files
+   3. npm ci && npm test && npm run build Vite + React
+   4. push website/frontend/dist to gh-pages (orphan commit)
+        ▼
+https://<user>.github.io/<repo>/          HTML + JS + data/ (about 2 GB, fetched a few files at a time)
 ```
 
-### Why sharded JSON instead of an API?
+The data format is documented in `scripts/README.md`. In short: one small
+core shard per taxon, a `higher/` shard that carries a taxon's full ancestry,
+`detail/` for common names and distribution, `kids/` for paged children and
+synonyms, and an adaptive prefix index for search that is never truncated.
+A species page costs three or four fetches of 50–350 KB each.
 
-A 2.4 GB TSV is too big to load in a browser. A traditional API requires a
-server — and we want this to be free, immortal, and trivially forkable.
-The processor splits all ~5 million records into **1024 hash buckets**.
-The browser computes the bucket for any clicked ID using the same
-`djb2` hash and fetches a single ~500 KB file. Once cached, that bucket
-serves every taxon it contains for the rest of the session.
+## Frontend
 
-Search uses the same trick, sharded by the first two characters of the
-lowercased name (so `ho.json` holds everything starting with "ho").
-
-Result: cold-start renders in well under a second; subsequent navigation
-is essentially instant.
-
----
-
-## File map
+`frontend/src/`
 
 | Path | Purpose |
 | --- | --- |
-| `frontend/`                       | Vite + React app (HashRouter, no SSR). |
-| `frontend/src/api.js`             | Client-side data layer (sharding, search, lineage walk). |
-| `frontend/src/pages/*.jsx`        | Home, Explore, Search, Taxon, About. |
-| `frontend/src/components/*.jsx`   | Breadcrumbs, taxon cards, global search bar. |
-| `scripts/process_data.py`         | Streams the TSVs through SQLite, emits sharded JSON. |
-| `.github/workflows/deploy.yml`    | Triggers on Release publish: download → process → build → push to `gh-pages`. |
-| `GUIDE.md`                        | Click-by-click setup guide for non-coders. |
+| `data/hash.js` | djb2 shard hash and search-key normaliser, identical to the Python side |
+| `data/api.js` | fetch layer with caching and retry; records, lineage, children, search |
+| `data/labels.js` | status wording, language names, rank helpers |
+| `components/SearchBox.jsx` | ARIA combobox used by the header, home page and Compare |
+| `components/*` | cards, pills, breadcrumbs, pager, skeletons, theme toggle, error boundary |
+| `pages/Home.jsx` | search, dataset numbers, top-level groups, species-by-kingdom chart |
+| `pages/Explore.jsx` | expandable tree from the domains down |
+| `pages/Taxon.jsx` | record page: classification, names, distribution, children and synonyms |
+| `pages/Compare.jsx` | shared-classification comparison of two to six organisms |
+| `pages/SearchResults.jsx`, `About.jsx`, `NotFound.jsx` | |
+| `styles/tokens.css` | light and dark design tokens |
+| `styles/app.css` | all component styles |
 
----
+Routing uses clean URLs (`/taxon/4CGXQ`). `scripts/postbuild.mjs` copies
+`index.html` to `404.html` so GitHub Pages serves the app for any path, and
+`main.jsx` redirects old `#/taxon/…` links.
 
-## Local development (optional, for tinkerers)
+Accessibility: every text/background pair in the tokens meets WCAG 2.2 AA,
+keyboard focus is always visible, the search box follows the combobox
+pattern, motion respects `prefers-reduced-motion`, and the theme follows the
+OS until the visitor picks one.
 
-You don't need this to deploy — the GitHub Action does everything — but if
-you want to preview locally:
+## Local development
+
+You need Node 20.19+ (22 recommended) and Python 3.10+.
 
 ```bash
-# 1. Generate a small dataset (subset for speed). Run from the repo root.
-python3 scripts/process_data.py \
-  --input "/path/to/folder/with/the/tsv/files" \
-  --output frontend/public/data \
-  --limit 50000
+# 1. Build a dataset. Either a realistic subset (recommended, a few minutes) …
+python3 scripts/process_data.py --input /path/to/coldp --output frontend/public/data --subtree 3W7,623RM
+#    … or the full dataset (about 6 minutes and 2 GB on a laptop):
+python3 scripts/process_data.py --input /path/to/coldp --output frontend/public/data
 
-# 2. Start the dev server.
+# 2. Run the site
 cd frontend
-npm install
-npm run dev
+npm ci
+npm run dev        # http://localhost:5173
+npm test           # vitest
+npm run build      # production build in dist/
 ```
 
-Then open http://localhost:5173.
+`/path/to/coldp` is the unzipped Catalogue of Life download, or a folder with
+`NameUsage_part_*` split parts (they are streamed, never reassembled).
 
----
+## Deploying your own copy
 
-## Tuning knobs
+1. Fork or push this repository to a public GitHub repo.
+2. Settings → Pages → Source: *Deploy from a branch* → `gh-pages` / root
+   (the branch appears after the first successful run).
+3. Download the ColDP export from https://www.catalogueoflife.org/data/download.
+   `NameUsage.tsv` is larger than the 2 GB Release asset limit, so split it:
+   `split -b 1500m NameUsage.tsv NameUsage_part_`.
+4. Create a Release (tag `data-v1`) and attach `NameUsage_part_aa`,
+   `NameUsage_part_ab`, `VernacularName.tsv`, `Distribution.tsv` and
+   `metadata.yaml`. Publishing the release starts the build.
+5. Watch the Actions tab. A full build takes roughly 20–40 minutes on a
+   GitHub runner; frontend-only re-runs (Actions → *Build and deploy site* →
+   *Run workflow* with the same tag) reuse the cached data and take 2–3 minutes.
 
-Most decisions live as constants at the top of `scripts/process_data.py`:
+Updating to a newer Catalogue of Life release: repeat step 4 with a new tag.
 
-```python
-NUM_SHARDS = 1024                  # taxa & search shards
-INSERT_BATCH = 20000               # SQLite write batching
-MAX_VERNACULARS_PER_TAXON = 8      # commons-name cap per record
-MAX_DISTRIBUTION_PER_TAXON = 30    # distribution-row cap per record
-```
+Troubleshooting:
 
-If you change `NUM_SHARDS`, change the matching constant in
-`frontend/src/api.js` — the hash must produce the same bucket on both
-sides.
-
----
+| Symptom | Cause |
+| --- | --- |
+| "no NameUsage.tsv or NameUsage_part_* assets" | asset names on the release don't match (case-sensitive) |
+| Site shows "The dataset could not be loaded" | the data step failed, or Pages is not set to `gh-pages`; check the Actions log |
+| Blank page after deploy | hard-refresh; confirm Pages source |
 
 ## Licence
 
-Code: MIT. Data: CC BY 4.0 (Catalogue of Life consortium).
+Code: MIT (see `../LICENSE`). Data: Catalogue of Life, CC BY 4.0. Cite the
+release shown in the site footer (title, version, DOI).

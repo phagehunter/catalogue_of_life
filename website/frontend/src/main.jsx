@@ -1,15 +1,24 @@
 import React from 'react'
 import ReactDOM from 'react-dom/client'
-import { HashRouter } from 'react-router-dom'
+import { BrowserRouter } from 'react-router-dom'
 import App from './App.jsx'
-import './styles.css'
+import { applyStoredTheme } from './components/ThemeToggle.jsx'
+import './styles/app.css'
 
-// HashRouter is the right call for GitHub Pages: it works with no
-// server-side config and never 404s on a deep link refresh.
+const base = (import.meta.env.BASE_URL || '/').replace(/\/$/, '')
+
+// Links from the old HashRouter site (…/#/taxon/ID) keep working.
+if (window.location.hash.startsWith('#/')) {
+  const target = base + window.location.hash.slice(1)
+  window.history.replaceState(null, '', target)
+}
+
+applyStoredTheme()
+
 ReactDOM.createRoot(document.getElementById('root')).render(
   <React.StrictMode>
-    <HashRouter>
+    <BrowserRouter basename={base || '/'}>
       <App />
-    </HashRouter>
+    </BrowserRouter>
   </React.StrictMode>,
 )

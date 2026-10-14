@@ -1,276 +1,135 @@
-name: Build & Deploy Catalogue of Life Site (v2 — subdir-aware)
+name: Build and deploy site
 
-# =============================================================================
-#  PROJECT LAYOUT
-#  -----------------------------------------------------------------------------
-#  This repo's actual code lives in a `website/` subfolder. Every path below
-#  is therefore anchored to either:
-#
-#    $GITHUB_WORKSPACE/website/   →  the project root (Python script, frontend)
-#    $GITHUB_WORKSPACE/raw/       →  scratch dir for the downloaded TSV files
-#
-#  We never use bare relative paths like `scripts/…` or `frontend/…`,
-#  because the runner's current working directory is whatever a previous
-#  step happened to leave it at.
-# =============================================================================
-
+# Runs when a data Release is published (the release must carry the ColDP
+# files) or manually from the Actions tab. The processed data is cached per
+# (release tag, row limit, processor version), so a frontend-only re-run with
+# the same tag finishes in a couple of minutes.
 on:
   release:
     types: [published]
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'Release tag holding the .tsv files (e.g. data-v1)'
+        description: 'Release tag holding the ColDP files (e.g. data-v1)'
         required: true
         default: 'data-v1'
       limit:
-        description: 'Optional row cap per TSV (e.g. 50000 for a fast smoke test). Leave blank for the full build.'
+        description: 'Optional row cap per TSV for a smoke test (e.g. 50000). Blank = full build.'
         required: false
         default: ''
 
 permissions:
-  contents: write     # needed to push to the gh-pages branch
-  pages: read
-  id-token: write
+  contents: write   # push to the gh-pages branch
 
 concurrency:
   group: pages
   cancel-in-progress: false
 
+env:
+  PYTHON_VERSION: '3.12'
+  NODE_VERSION: '22'
+
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
-
-    # All paths are derived from these four env vars. If you ever rename
-    # the `website/` folder, change ONLY this block.
+    timeout-minutes: 120
     env:
       RELEASE_TAG: ${{ github.event.release.tag_name || github.event.inputs.release_tag || 'data-v1' }}
-      ROW_LIMIT:   ${{ github.event.inputs.limit || '' }}
+      ROW_LIMIT: ${{ github.event.inputs.limit || '' }}
       PROJECT_DIR: ${{ github.workspace }}/website
-      RAW_DIR:     ${{ github.workspace }}/raw
-      DATA_DIR:    ${{ github.workspace }}/website/frontend/public/data
-      DIST_DIR:    ${{ github.workspace }}/website/frontend/dist
+      RAW_DIR: ${{ github.workspace }}/raw
+      DATA_DIR: ${{ github.workspace }}/website/frontend/public/data
 
     steps:
-      # =====================================================================
-      #  STEP 1 — Checkout
-      # =====================================================================
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      # =====================================================================
-      #  STEP 2 — Verify project layout (fails fast if the repo is wrong)
-      #
-      #  This runs in 2 seconds and gives you a precise diagnostic instead
-      #  of a confusing failure 30 minutes into the build.
-      # =====================================================================
-      - name: Verify project layout
+      - name: Show trigger
         run: |
-          set -e
-          echo "::group::Diagnostics"
-          echo "GITHUB_WORKSPACE = $GITHUB_WORKSPACE"
-          echo "PROJECT_DIR      = $PROJECT_DIR"
-          echo "PWD              = $(pwd)"
-          echo
-          echo "Repo root contents:"
-          ls -la "$GITHUB_WORKSPACE"
-          echo
-          echo "website/ contents:"
-          ls -la "$PROJECT_DIR" || true
-          echo "::endgroup::"
+          echo "Event:       ${{ github.event_name }}"
+          echo "Release tag: $RELEASE_TAG"
+          echo "Row limit:   ${ROW_LIMIT:-<none: full build>}"
 
-          MISSING=0
-          for REQUIRED in \
-              "$PROJECT_DIR/scripts/process_data.py" \
-              "$PROJECT_DIR/frontend/package.json" \
-              "$PROJECT_DIR/frontend/vite.config.js" ; do
-            if [ ! -f "$REQUIRED" ]; then
-              echo "::error::Missing required file: $REQUIRED"
-              MISSING=1
-            else
-              echo "✓ found $REQUIRED"
-            fi
-          done
-
-          if [ "$MISSING" -ne 0 ]; then
-            echo "::error::Project layout check failed."
-            echo "Expected the project to live under $PROJECT_DIR with"
-            echo "scripts/process_data.py and frontend/package.json inside it."
-            exit 1
-          fi
-          echo "Layout OK ✓"
-
-      # =====================================================================
-      #  STEP 3 — Trigger info
-      # =====================================================================
-      - name: Show what triggered this run
+      - name: Free disk space
         run: |
-          echo "Event:        ${{ github.event_name }}"
-          echo "Release tag:  $RELEASE_TAG"
-          echo "Row limit:    ${ROW_LIMIT:-<none — full build>}"
-
-      # =====================================================================
-      #  STEP 4 — Free disk space (the TSVs unpack to ~3.5 GB)
-      # =====================================================================
-      - name: Free up disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
-                      /usr/share/swift /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/share/swift /opt/hostedtoolcache/CodeQL || true
           df -h /
 
-      # =====================================================================
-      #  STEP 5 — Install Python and Node toolchains
-      # =====================================================================
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: website/frontend/package-lock.json
 
-      # =====================================================================
-      #  STEP 6 — Cache restore
-      #  -------------------------------------------------------------------
-      #  Keyed on (release tag + row limit). If we already built this exact
-      #  data before, we skip the slow steps entirely.
-      # =====================================================================
+      - name: Processor unit tests
+        working-directory: website/scripts
+        run: python -m unittest tests/test_process_data.py
+
+      # Keyed on the release tag, the row limit AND the processor source, so
+      # a change to process_data.py always produces fresh data.
       - name: Restore processed data from cache
         id: cache-data
         uses: actions/cache@v4
         with:
           path: website/frontend/public/data
-          key: col-data-${{ env.RELEASE_TAG }}-limit-${{ env.ROW_LIMIT || 'full' }}-v1
+          key: col-data-${{ env.RELEASE_TAG }}-limit-${{ env.ROW_LIMIT || 'full' }}-${{ hashFiles('website/scripts/process_data.py') }}
 
-      # =====================================================================
-      #  STEP 7 — Download the release assets we care about
-      # =====================================================================
-      - name: Download TSVs from GitHub Release
+      - name: Download ColDP files from the Release
         if: steps.cache-data.outputs.cache-hit != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p "$RAW_DIR"
-          echo "Pulling release '$RELEASE_TAG' from $GITHUB_REPOSITORY …"
-          # The release contains 13 assets but we only need these three patterns.
-          for PATTERN in "NameUsage_part_*" "VernacularName.tsv" "Distribution.tsv"; do
-            echo "  fetching $PATTERN"
-            gh release download "$RELEASE_TAG" \
-              --repo "${GITHUB_REPOSITORY}" \
-              --pattern "$PATTERN" \
-              --dir "$RAW_DIR" \
-              --clobber
+          for PATTERN in "NameUsage.tsv" "NameUsage_part_*" "VernacularName.tsv" "Distribution.tsv" "metadata.yaml"; do
+            gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$PATTERN" --dir "$RAW_DIR" --clobber || true
           done
-          echo
-          echo "Downloaded:"
           ls -lah "$RAW_DIR"
-
-      # =====================================================================
-      #  STEP 8 — Reassemble NameUsage.tsv from the split parts
-      # =====================================================================
-      - name: Reassemble NameUsage.tsv from split parts
-        if: steps.cache-data.outputs.cache-hit != 'true'
-        working-directory: ${{ github.workspace }}/raw
-        run: |
-          set -e
-          echo "PWD: $(pwd)"
-          PARTS=( NameUsage_part_* )
-          if [ "${#PARTS[@]}" -eq 0 ] || [ ! -e "${PARTS[0]}" ]; then
-            echo "::error::No NameUsage_part_* files in $(pwd)."
-            echo "Did you upload them under the tag '$RELEASE_TAG'?"
+          if ! ls "$RAW_DIR"/NameUsage* >/dev/null 2>&1; then
+            echo "::error::Release '$RELEASE_TAG' has no NameUsage.tsv or NameUsage_part_* assets."
             exit 1
           fi
-          echo "Combining ${#PARTS[@]} parts:"
-          ls -lah "${PARTS[@]}"
-          cat "${PARTS[@]}" > NameUsage.tsv
-          rm -f "${PARTS[@]}"
-          echo "Result:"
-          ls -lah NameUsage.tsv
-          head -1 NameUsage.tsv | tr '\t' '\n' | head -5
-          wc -l NameUsage.tsv
 
-      # =====================================================================
-      #  STEP 9 — Run the processor
-      #  -------------------------------------------------------------------
-      #  Belt + suspenders: we BOTH `cd` into the project root AND pass an
-      #  absolute path. Either by itself would be enough; together they make
-      #  this step impervious to any cwd surprises from previous steps.
-      # =====================================================================
-      - name: Process TSVs into static JSON shards
+      - name: Process ColDP into static data
         if: steps.cache-data.outputs.cache-hit != 'true'
-        working-directory: ${{ github.workspace }}/website
         run: |
-          set -e
-          echo "PWD: $(pwd)"
-          echo "Will run script: $PROJECT_DIR/scripts/process_data.py"
-          ls -la "$PROJECT_DIR/scripts/"
-
-          mkdir -p "$DATA_DIR"
-
-          if [ -n "$ROW_LIMIT" ]; then
-            python "$PROJECT_DIR/scripts/process_data.py" \
-              --input  "$RAW_DIR" \
-              --output "$DATA_DIR" \
-              --limit  "$ROW_LIMIT"
-          else
-            python "$PROJECT_DIR/scripts/process_data.py" \
-              --input  "$RAW_DIR" \
-              --output "$DATA_DIR"
-          fi
-
-          echo "Output produced:"
-          du -sh "$DATA_DIR"
-          # Free disk before the frontend build — we no longer need the raw TSVs.
+          ARGS=(--input "$RAW_DIR" --output "$DATA_DIR")
+          if [ -n "$ROW_LIMIT" ]; then ARGS+=(--limit "$ROW_LIMIT"); fi
+          python "$PROJECT_DIR/scripts/process_data.py" "${ARGS[@]}"
           rm -rf "$RAW_DIR"
-          df -h /
+          du -sh "$DATA_DIR"
+          echo "Files: $(find "$DATA_DIR" -type f | wc -l)"
 
-      - name: Note when reusing cached data
+      - name: Using cached data
         if: steps.cache-data.outputs.cache-hit == 'true'
-        run: |
-          echo "✅ Reused cached data from a previous run (tag: $RELEASE_TAG)."
-          du -sh "$DATA_DIR" || true
+        run: echo "Reused processed data for $RELEASE_TAG"; du -sh "$DATA_DIR"
 
-      # =====================================================================
-      #  STEP 10 — Build the React frontend
-      # =====================================================================
       - name: Install frontend dependencies
-        working-directory: ${{ github.workspace }}/website/frontend
-        run: |
-          echo "PWD: $(pwd)"
-          ls -la
-          npm ci || npm install
+        working-directory: website/frontend
+        run: npm ci
+
+      - name: Frontend tests
+        working-directory: website/frontend
+        run: npm test
 
       - name: Build frontend
-        working-directory: ${{ github.workspace }}/website/frontend
+        working-directory: website/frontend
         env:
-          # Vite needs the public path so assets resolve under
-          # https://<user>.github.io/<repo>/ correctly.
           VITE_BASE_PATH: /${{ github.event.repository.name }}/
-        run: |
-          echo "PWD: $(pwd)"
-          npm run build
+        run: npm run build
 
-      - name: Show output sizes
-        run: |
-          du -sh "$DIST_DIR"
-          du -sh "$DIST_DIR/data" || true
-          echo "Total files: $(find "$DIST_DIR" -type f | wc -l)"
-
-      # =====================================================================
-      #  STEP 11 — Deploy to gh-pages branch
-      # =====================================================================
-      - name: Deploy to gh-pages branch
+      - name: Deploy to gh-pages
         uses: peaceiris/actions-gh-pages@v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir:  website/frontend/dist
+          publish_dir: website/frontend/dist
           publish_branch: gh-pages
-          # Force orphan history each push — keeps the gh-pages branch tiny
-          # (otherwise every rebuild would add a ~750 MB commit on top).
           force_orphan: true
-          user_name:  'github-actions[bot]'
+          user_name: 'github-actions[bot]'
           user_email: 'github-actions[bot]@users.noreply.github.com'
           commit_message: 'Deploy ${{ env.RELEASE_TAG }} (${{ github.sha }})'

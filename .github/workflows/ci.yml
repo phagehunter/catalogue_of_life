@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: website/frontend/package-lock.json
+      - name: Processor tests
+        working-directory: website/scripts
+        run: python -m unittest tests/test_process_data.py
+      - name: Frontend install
+        working-directory: website/frontend
+        run: npm ci
+      - name: Frontend tests
+        working-directory: website/frontend
+        run: npm test
+      - name: Frontend build
+        working-directory: website/frontend
+        run: npm run build
