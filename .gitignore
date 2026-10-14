@@ -1,10 +1,24 @@
+# Raw Catalogue of Life data never goes in git: it lives in a GitHub Release.
 *.tsv
 *.bib
-*.json
-*.yaml
-source/
 *.jsonl
-*.json
-*.tsv
-*.bib
-*.yaml
+NameUsage_part_*
+metadata.yaml
+reference.json
+raw/
+source/
+
+# Build output and generated data
+node_modules/
+website/frontend/dist/
+website/frontend/public/data/
+_scratch_*.sqlite
+*.sqlite
+
+# Tooling
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+.vscode/
+.idea/

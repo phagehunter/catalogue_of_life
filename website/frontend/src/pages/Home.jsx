@@ -1,168 +1,106 @@
-import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { getRoots, getStats } from '../api.js'
-import TaxonCard from '../components/TaxonCard.jsx'
-import Loader from '../components/Loader.jsx'
-import './LCA.css'
+import SearchBox from '../components/SearchBox.jsx'
+import BarChart from '../components/BarChart.jsx'
+import Citation from '../components/Citation.jsx'
+import useTitle from '../components/useTitle.js'
+import { useMeta } from '../components/MetaContext.jsx'
+import { TreeIcon, CompareIcon, BookIcon } from '../components/Icons.jsx'
+import { formatCount, rankLabel } from '../data/labels.js'
 
 export default function Home() {
-  const [stats, setStats] = useState(null)
-  const [roots, setRoots] = useState(null)
-  const [error, setError] = useState(null)
+  const meta = useMeta()
+  const c = meta.counts
+  useTitle('', `Browse, search and compare ${formatCount(c.acceptedSpecies)} accepted species from the Catalogue of Life.`)
 
-  useEffect(() => {
-    Promise.all([getStats(), getRoots()])
-      .then(([s, r]) => { setStats(s); setRoots(r) })
-      .catch(e => setError(e.message || String(e)))
-  }, [])
+  const kingdoms = Object.entries(c.byKingdom || {})
+    .map(([name, ranks]) => ({ label: name, value: ranks.species || 0, sub: `${formatCount(ranks.species || 0)} accepted species · ${formatCount(ranks.genus || 0)} genera · ${formatCount(ranks.family || 0)} families` }))
+    .filter(k => k.value > 0)
+    .sort((a, b) => b.value - a.value)
+  const topKingdoms = kingdoms.slice(0, 8)
+  const rest = kingdoms.slice(8).reduce((n, k) => n + k.value, 0)
+  if (rest) topKingdoms.push({ label: `${kingdoms.length - 8} other kingdoms`, value: rest })
 
   return (
     <div className="page">
       <section className="hero">
-        <h1>Tools for the Tree of Life</h1>
+        <h1>Every named species, one search away</h1>
         <p className="lede">
-          Five million species. Two million common names. One free, static
-          site that lets you do things no other taxonomy explorer can.
+          An independent explorer for the Catalogue of Life: {formatCount(c.acceptedSpecies)} accepted
+          species, {formatCount(c.nameUsages)} scientific names including synonyms,
+          and {formatCount(c.vernaculars)} common names in {c.vernacularLanguages?.length || 'many'}+ languages.
         </p>
-        <div className="cta-row">
-          <Link to="/lca" className="cta primary">★ Compare species →</Link>
-          <Link to="/explore" className="cta">Browse the tree</Link>
-          <Link to="/search" className="cta">Search a name</Link>
+        <SearchBox size="lg" autoFocus placeholder="Try “Panthera tigris”, “oak”, or “tigris”…" />
+        <p className="examples">
+          Examples: <Link to="/search?q=Panthera%20tigris">Panthera tigris</Link> · <Link to="/search?q=tiger">tiger</Link> · <Link to="/search?q=Quercus">Quercus</Link> · <Link to="/search?q=sapiens">sapiens</Link>
+        </p>
+      </section>
+
+      <section className="feature-grid" aria-label="What you can do here">
+        <Link className="card feature" to="/explore">
+          <TreeIcon className="icon" />
+          <h2>Explore the tree</h2>
+          <p>Start at the domains of life and open any branch down to species, subspecies and DNA barcode clusters.</p>
+          <span className="go">Open the tree →</span>
+        </Link>
+        <Link className="card feature" to="/compare">
+          <CompareIcon className="icon" />
+          <h2>Compare species</h2>
+          <p>Pick two to six organisms and see where their classifications meet: same genus, same family, or barely the same kingdom.</p>
+          <span className="go">Compare →</span>
+        </Link>
+        <Link className="card feature" to="/about">
+          <BookIcon className="icon" />
+          <h2>About the data</h2>
+          <p>Where the data comes from, what the eXtended Release adds, and what this site does and does not claim.</p>
+          <span className="go">Read more →</span>
+        </Link>
+      </section>
+
+      <section aria-label="Dataset at a glance">
+        <h2 className="visually-hidden">Dataset at a glance</h2>
+        <div className="stats">
+          <Stat label="Accepted species" value={c.acceptedSpecies} />
+          <Stat label="All names" value={c.nameUsages} sub={`${formatCount(c.synonyms)} synonyms`} />
+          <Stat label="Common names" value={c.vernaculars} sub={`for ${formatCount(c.taxaWithVernaculars)} taxa`} />
+          <Stat label="Distribution records" value={c.distributions} />
+          <Stat label="Marked extinct" value={c.extinct} sub="accepted names" />
+          <Stat label="DNA barcode clusters" value={c.bins} sub="BOLD BINs from the XR" />
         </div>
       </section>
 
-      {error ? (
-        <div className="error">
-          <strong>Could not load dataset.</strong> Has the GitHub Action run yet? See the README.
-          <div style={{ marginTop: '.5rem', opacity: .8 }}>{error}</div>
-        </div>
-      ) : null}
+      <div className="grid-2">
+        <section className="panel">
+          <h2>Top-level groups</h2>
+          <ul className="inline-list">
+            {meta.roots.map(r => (
+              <li key={r.i}>
+                <Link to={`/taxon/${encodeURIComponent(r.i)}`}>{r.n}</Link>
+                <span className="muted small"> {rankLabel(meta.ranks[r.r]).toLowerCase()}{r.nc ? ` · ${formatCount(r.nc)} children` : ''}</span>
+              </li>
+            ))}
+          </ul>
+          <p className="small muted" style={{ marginTop: '.75rem' }}>
+            The Catalogue of Life groups life into three domains plus viruses. “Incertae sedis” holds names whose placement is still uncertain.
+          </p>
+        </section>
+        <section className="panel">
+          <h2>Accepted species by kingdom</h2>
+          <BarChart rows={topKingdoms} valueLabel="Accepted species by kingdom" />
+          <p className="small muted" style={{ marginTop: '.75rem' }}>Counts come from the kingdom recorded on each accepted species; DNA barcode clusters and synonyms are excluded.</p>
+        </section>
+      </div>
 
-      <section className="lca-feature">
-        <div className="lca-feature-card">
-          <div className="lca-feature-icon" aria-hidden>★</div>
-          <div className="lca-feature-body">
-            <h3>How related are these species?</h3>
-            <p>
-              Drop in two to six organisms — by Latin or common name. We build
-              a real phylogenetic tree and tell you exactly how closely every
-              pair is related: "siblings" (same genus), "cousins" (same family),
-              or "kingdom-mates" (totally different body plans).
-            </p>
-            <p className="lca-feature-examples">
-              Curated examples: <em>vertebrate body plans</em> · <em>three
-              solutions to flight</em> · <em>same-genus siblings</em>
-            </p>
-            <Link to="/lca" className="cta primary">Open the comparator →</Link>
-          </div>
-        </div>
-      </section>
-
-      {stats ? <StatStrip stats={stats} /> : !error ? <Loader label="Loading dataset stats" /> : null}
-
-      <section className="section" style={{ marginTop: '1.5rem' }}>
-        <h2>Or just browse the kingdoms</h2>
-        {roots ? (
-          roots.length === 0
-            ? <div className="empty">No roots found in the dataset.</div>
-            : (
-              <div className="cards">
-                {roots.map(r => (
-                  <TaxonCard
-                    key={r.i}
-                    taxon={{ i: r.i, n: r.n, r: r.r }}
-                  />
-                ))}
-              </div>
-            )
-        ) : !error ? <Loader /> : null}
-      </section>
-
-      {stats ? <KingdomBreakdown stats={stats} /> : null}
-    </div>
-  )
-}
-
-function StatStrip({ stats }) {
-  return (
-    <div className="stats">
-      <Stat label="Total taxa" value={stats.totalTaxa.toLocaleString()} />
-      <Stat label="Common names" value={stats.totalVernaculars.toLocaleString()} />
-      <Stat label="Distribution records" value={stats.totalDistributionEntries.toLocaleString()} />
-      <Stat
-        label="Marked extinct"
-        value={stats.extinctCount.toLocaleString()}
-        sub={pct(stats.extinctCount, stats.totalTaxa)}
-      />
-      <Stat label="Top-level groups" value={stats.rootCount.toLocaleString()} />
+      <p><Citation /></p>
     </div>
   )
 }
 
 function Stat({ label, value, sub }) {
   return (
-    <div className="stat">
+    <div className="card stat">
       <div className="label">{label}</div>
-      <div className="value">{value}</div>
+      <div className="value">{formatCount(value)}</div>
       {sub ? <div className="sub">{sub}</div> : null}
     </div>
-  )
-}
-
-function pct(part, whole) {
-  if (!whole) return ''
-  const p = (part / whole) * 100
-  return `${p.toFixed(p < 1 ? 2 : 1)}% of all taxa`
-}
-
-// Biodiversity by kingdom — replaces the previous global rank table.
-// Drives off stats.kingdomCounts emitted by the Python processor.
-function KingdomBreakdown({ stats }) {
-  const kc = stats.kingdomCounts || {}
-  const kingdoms = Object.entries(kc)
-    .map(([name, rankMap]) => {
-      const ranks = rankMap || {}
-      const total = Object.values(ranks).reduce((a, b) => a + b, 0)
-      return {
-        name,
-        total,
-        species: ranks.species || 0,
-        genus: ranks.genus || 0,
-        family: ranks.family || 0,
-      }
-    })
-    .filter(k => k.total > 0)
-    .sort((a, b) => b.total - a.total)
-
-  if (kingdoms.length === 0) return null
-  const max = Math.max(...kingdoms.map(k => k.total))
-
-  return (
-    <section className="section" style={{ marginTop: '1rem' }}>
-      <h2>Biodiversity by kingdom</h2>
-      <p style={{ color: 'var(--ink-dim)', marginTop: 0 }}>
-        How named taxa are distributed across the major branches of life — the
-        full count for each kingdom and how many of those are species.
-      </p>
-      <div className="rank-chart">
-        {kingdoms.map(k => (
-          <div
-            className="row"
-            key={k.name}
-            title={`${k.total.toLocaleString()} total · ${k.species.toLocaleString()} species · ${k.genus.toLocaleString()} genera · ${k.family.toLocaleString()} families`}
-          >
-            <span className="label">
-              <em style={{ fontStyle: k.name.startsWith('(') ? 'normal' : 'italic' }}>{k.name}</em>
-            </span>
-            <span className="bar"><span style={{ width: `${(k.total / max) * 100}%` }} /></span>
-            <span className="num">{k.total.toLocaleString()}</span>
-          </div>
-        ))}
-      </div>
-      <p style={{ color: 'var(--ink-faint)', fontSize: '0.82rem', marginTop: '0.85rem', marginBottom: 0 }}>
-        Total named taxa per kingdom. Hover any row to see the breakdown
-        (species / genera / families).
-      </p>
-    </section>
   )
 }

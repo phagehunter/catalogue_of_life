@@ -1,0 +1,104 @@
+/* ===========================================================================
+   Design tokens. Light is the default; dark follows the OS unless the user
+   picks a theme (data-theme on <html>). Every text/background pair used for
+   body text meets WCAG 2.2 AA (4.5:1); see docs in website/README.md.
+   =========================================================================== */
+
+:root {
+  color-scheme: light;
+  --bg:          #f6f8f6;
+  --surface:     #ffffff;
+  --surface-2:   #edf2ee;
+  --surface-3:   #e2eae4;
+  --line:        #d3dcd6;
+  --line-strong: #b7c4bb;
+  --ink:         #16211c;
+  --ink-2:       #3d4c45;
+  --ink-3:       #5b6b63;
+  --accent:      #1e7a4c;
+  --accent-strong:#155f3a;
+  --accent-soft: #dff1e6;
+  --on-accent:   #ffffff;
+  --gold:        #7a5d0f;
+  --gold-soft:   #f6ecc9;
+  --rust:        #9b3c1d;
+  --rust-soft:   #f8e3da;
+  --info-soft:   #e3ecf7;
+  --info:        #2b568f;
+  --shadow:      0 8px 28px -14px rgba(16, 32, 24, .35);
+  --focus:       #1e7a4c;
+
+  --font: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  --fs-xs: .78rem; --fs-sm: .875rem; --fs-md: 1rem; --fs-lg: 1.125rem;
+  --fs-xl: 1.375rem; --fs-2xl: 1.75rem; --fs-3xl: clamp(2rem, 4.5vw, 2.75rem);
+
+  --sp-1: .25rem; --sp-2: .5rem; --sp-3: .75rem; --sp-4: 1rem; --sp-5: 1.5rem;
+  --sp-6: 2rem; --sp-7: 3rem;
+
+  --radius-sm: 6px; --radius: 12px; --radius-lg: 18px;
+  --maxw: 1180px;
+  --topbar-h: 60px;
+  --ease: 160ms cubic-bezier(.4, 0, .2, 1);
+
+  /* Chart series (categorical) – AA against both surfaces for text use */
+  /* Categorical series: validated reference palette (dataviz skill), fixed order */
+  --series-1: #2a78d6; --series-2: #eb6834; --series-3: #1baf7a;
+  --series-4: #eda100; --series-5: #e87ba4; --series-6: #008300;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg:          #0f1715;
+    --surface:     #16211d;
+    --surface-2:   #1d2b26;
+    --surface-3:   #253630;
+    --line:        #2d3f38;
+    --line-strong: #43584f;
+    --ink:         #e8efeb;
+    --ink-2:       #bccac3;
+    --ink-3:       #98a9a1;
+    --accent:      #6fd49a;
+    --accent-strong:#8ee3b1;
+    --accent-soft: #1b3a2b;
+    --on-accent:   #06120d;
+    --gold:        #e9c76a;
+    --gold-soft:   #3a3014;
+    --rust:        #f0a283;
+    --rust-soft:   #3f2118;
+    --info-soft:   #1c2b40;
+    --info:        #9cbdf0;
+    --shadow:      0 10px 36px -14px rgba(0, 0, 0, .6);
+    --focus:       #8ee3b1;
+    --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70;
+    --series-4: #c98500; --series-5: #d55181; --series-6: #008300;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg:          #0f1715;
+  --surface:     #16211d;
+  --surface-2:   #1d2b26;
+  --surface-3:   #253630;
+  --line:        #2d3f38;
+  --line-strong: #43584f;
+  --ink:         #e8efeb;
+  --ink-2:       #bccac3;
+  --ink-3:       #98a9a1;
+  --accent:      #6fd49a;
+  --accent-strong:#8ee3b1;
+  --accent-soft: #1b3a2b;
+  --on-accent:   #06120d;
+  --gold:        #e9c76a;
+  --gold-soft:   #3a3014;
+  --rust:        #f0a283;
+  --rust-soft:   #3f2118;
+  --info-soft:   #1c2b40;
+  --info:        #9cbdf0;
+  --shadow:      0 10px 36px -14px rgba(0, 0, 0, .6);
+  --focus:       #8ee3b1;
+  --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70;
+  --series-4: #c98500; --series-5: #d55181; --series-6: #008300;
+}
