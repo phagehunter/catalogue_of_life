@@ -23,7 +23,7 @@ export default function Home() {
   return (
     <div className="page">
       <section className="hero">
-        <h1>Every named species, one search away</h1>
+        <h1>Search every named species in the Catalogue of Life</h1>
         <p className="lede">
           An independent explorer for the Catalogue of Life: {formatCount(c.acceptedSpecies)} accepted
           species, {formatCount(c.nameUsages)} scientific names including synonyms,
@@ -52,7 +52,7 @@ export default function Home() {
           <BookIcon className="icon" />
           <h2>About the data</h2>
           <p>Where the data comes from, what the eXtended Release adds, and what this site does and does not claim.</p>
-          <span className="go">Read more →</span>
+          <span className="go">Read about the data →</span>
         </Link>
       </section>
 

@@ -34,7 +34,7 @@ let metaPromise
 export function getMeta() {
   if (!metaPromise) {
     metaPromise = fetchJson('meta.json').then(m => {
-      if (!m) throw new Error('meta.json not found — has the data build run?')
+      if (!m) throw new Error('meta.json was not found; the data build may not have run yet.')
       if (m.schema !== 2) throw new Error(`Unsupported data schema ${m.schema}`)
       return m
     })

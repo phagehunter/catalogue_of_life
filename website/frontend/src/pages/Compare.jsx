@@ -143,7 +143,7 @@ export default function Compare() {
 
       {species.length < 2 ? (
         <section>
-          <h2>Try a curated comparison</h2>
+          <h2>Start from an example comparison</h2>
           <div className="preset-grid">
             {PRESETS.map(p => (
               <button key={p.label} type="button" className="card preset" onClick={() => loadPreset(p.queries)}>
