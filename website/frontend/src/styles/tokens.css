@@ -42,8 +42,7 @@
   --topbar-h: 60px;
   --ease: 160ms cubic-bezier(.4, 0, .2, 1);
 
-  /* Chart series (categorical) – AA against both surfaces for text use */
-  /* Categorical series: validated reference palette (dataviz skill), fixed order */
+  /* Chart series (categorical), fixed order; each color meets WCAG AA against both surfaces when used for text. */
   --series-1: #2a78d6; --series-2: #eb6834; --series-3: #1baf7a;
   --series-4: #eda100; --series-5: #e87ba4; --series-6: #008300;
 }
